@@ -215,10 +215,19 @@ def restore_backup(app: dict, backup_name: str) -> None:
     """Spielt ein Backup ein -- überschreibt echte Live-Daten, deshalb
     erst ein eigenes Sicherheits-Backup des aktuellen Stands (falls man
     sich beim Auswählen vertan hat), dann Dienst stoppen, Dateien
-    ersetzen, Dienst wieder starten."""
-    backup_dir = BACKUP_DIR / app["name"] / backup_name
-    if not backup_dir.is_dir():
+    ersetzen, Dienst wieder starten.
+
+    backup_name kommt roh aus der URL (POST /restore/<idx>/<backup_name>)
+    -- ungeprüft wäre das ein echter Path-Traversal-Weg (z.B.
+    "../../../../tmp"), über den ein Angreifer mit gültigen Zugangsdaten
+    (oder ein erfolgreicher CSRF trotz Origin-Check) beliebige Dateien
+    von der Platte über die echte regobase.db/regobase.env kopieren
+    lassen könnte, solange sie passend benannt sind. Deshalb: nur exakt
+    ein Name aus list_backups() (also ein Ordner, den make_backup()
+    selbst angelegt hat) wird akzeptiert -- Allowlist statt Blocklist."""
+    if backup_name not in list_backups(app["name"]):
         raise FileNotFoundError(f"Backup {backup_name} nicht gefunden.")
+    backup_dir = BACKUP_DIR / app["name"] / backup_name
 
     make_backup(app)  # Sicherheitsnetz vor dem Überschreiben
 
