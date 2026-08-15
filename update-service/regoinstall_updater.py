@@ -87,6 +87,7 @@ import html
 import io
 import json
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -242,13 +243,16 @@ def check_auth(header: str | None) -> bool:
     except (VerifyMismatchError, InvalidHash):
         return False
     if ok:
-        global _pending_first_login
+        global _pending_first_login, _first_login_token
         _pending_first_login = None  # einmal erfolgreich eingeloggt, Hinweis nicht mehr nötig
+        _first_login_token = None
     return ok
 
 
 _pending_first_login: str | None = None
+_first_login_token: str | None = None
 _FIRST_LOGIN_RE = re.compile(r"Erstinstallations-Admin-Login:\s*(\S+)\s*/\s*(\S+)")
+FIRST_LOGIN_COOKIE = "regoinstall_first_login"
 
 
 def run_job_async(name: str, cmd: list[str]) -> bool:
@@ -721,19 +725,39 @@ class Handler(BaseHTTPRequestHandler):
             # nie bei check_auth() ankommen und _pending_first_login (das
             # dort bei Erfolg gelöscht wird) bliebe für immer gesetzt.
             return True
-        if path in ("/first-login", "/") and _pending_first_login is not None:
+        if (
+            path in ("/first-login", "/")
+            and _pending_first_login is not None
+            and _first_login_token is not None
+            and secrets.compare_digest(self._get_cookie(FIRST_LOGIN_COOKIE) or "", _first_login_token)
+        ):
             # Direkter Nutzerwunsch, nach einem echten Vorfall (Passwort
             # nur im Log, Log verpasst, dauerhaft ausgesperrt): diese beiden
-            # Routen bleiben ohne gültige Anmeldung erreichbar, aber NUR
-            # solange das generierte Passwort noch nie erfolgreich benutzt
-            # wurde (siehe oben). "/" muss mit rein, sonst bekäme der Nutzer
-            # beim ersten Aufruf nach der Installation sofort einen
-            # Basic-Auth-Dialog (kein gecachtes Passwort!) statt der
-            # Weiterleitung zu /first-login -- genau der Fall, den diese
-            # Seite lösen soll.
+            # Routen bleiben ohne gültige Anmeldung erreichbar, aber NUR für
+            # den Browser, der die Installation selbst gestartet hat (das
+            # eigene, bei "POST /install" gesetzte Cookie muss passen) --
+            # NICHT für jeden im Netz. Security-Review hat zurecht
+            # angemerkt, dass eine reine "_pending_first_login is not None"-
+            # Prüfung das generierte Passwort für JEDEN mit Netzzugriff auf
+            # Port 80 unauthentifiziert abrufbar gemacht hätte (schlimmer
+            # als vorher, wo dafür Shell-/SSH-Zugriff nötig war). "/" muss
+            # mit rein, sonst bekäme der berechtigte Nutzer beim ersten
+            # Aufruf nach der Installation sofort einen Basic-Auth-Dialog
+            # (kein gecachtes Passwort!) statt der Weiterleitung zu
+            # /first-login -- genau der Fall, den diese Seite lösen soll.
             return True
         self._unauthorized()
         return False
+
+    def _get_cookie(self, name: str) -> str | None:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        for part in raw.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return value
+        return None
 
     def _send_html(self, body: str, status: int = 200):
         encoded = body.encode("utf-8")
@@ -743,9 +767,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _redirect(self, location: str):
+    def _redirect(self, location: str, extra_headers: dict[str, str] | None = None):
         self.send_response(303)
         self.send_header("Location", location)
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
 
     def do_GET(self):
@@ -918,7 +944,17 @@ class Handler(BaseHTTPRequestHandler):
             if not started:
                 self._send_html("<p>Installation läuft bereits. <a href='/log'>Log ansehen</a></p>")
                 return
-            self._redirect("/log")
+            # Token für den späteren /first-login-Zugriff: nur DIESER
+            # Browser (der die Installation gerade ausgelöst hat) bekommt
+            # das Cookie, siehe _require_auth()'s Kommentar dazu.
+            global _first_login_token
+            _first_login_token = secrets.token_urlsafe(32)
+            self._redirect(
+                "/log",
+                extra_headers={
+                    "Set-Cookie": f"{FIRST_LOGIN_COOKIE}={_first_login_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600"
+                },
+            )
             return
 
         if path.startswith("/update/"):
