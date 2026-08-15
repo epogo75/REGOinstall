@@ -53,13 +53,19 @@ GitHub-Konfiguration gebraucht.
 
 Nach erfolgreicher Installation leitet die Port-80-Seite automatisch auf
 `/first-login` weiter und zeigt dort das generierte Admin-Passwort
-(`admin` / `<generiert>`) groß und kopierbar an -- diese Seite ist
-absichtlich ohne Login erreichbar, aber nur so lange, bis sich der Account
-zum ersten Mal erfolgreich einloggt. Danach verhält sie sich wie jede
-andere Seite (Basic Auth gegen REGObase's echte Benutzer-DB, siehe unten).
+(`admin` / `<generiert>`) groß und kopierbar an. Diese Seite ist absichtlich
+ohne Basic Auth erreichbar, aber NICHT für jeden im Netz: `POST /install`
+setzt beim Start des Installations-Jobs ein zufälliges, `HttpOnly`-Cookie,
+und nur der Browser mit genau diesem Cookie darf `/` bzw. `/first-login`
+ohne Login sehen (per Sicherheits-Review gefunden und gefixt -- eine reine
+"ist noch offen"-Prüfung hätte das Passwort für jeden mit Netzzugriff auf
+Port 80 lesbar gemacht). Sobald sich der Account einmal erfolgreich
+einloggt, verhält sich die Seite wie jede andere (Basic Auth gegen
+REGObase's echte Benutzer-DB, siehe unten) -- unabhängig vom Browser.
 Das Passwort steht zusätzlich weiterhin im Installations-Log (Fallback,
 falls der Dienst zwischen Installationsende und erstem Login neu startet
--- dann geht der Hinweis im Arbeitsspeicher verloren, das Log bleibt).
+-- dann gehen der In-Memory-Hinweis und das Cookie verloren, das Log
+bleibt; in dem Fall braucht es Shell-/SSH-Zugriff, um es nachzulesen).
 
 **GitHub erneut verbinden:** die Hauptseite zeigt nach der Installation
 dauerhaft eine GitHub-Statuskarte ("Verbunden als ..." / "Nicht
