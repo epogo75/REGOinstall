@@ -46,6 +46,31 @@ ask() {
   fi
 }
 
+ask_password() {
+  # ask_password "Frage" -> setzt REPLY. Maskierte Eingabe (read -s, kein
+  # Klartext am Bildschirm) und zweimal abgefragt, damit ein Tippfehler
+  # nicht erst beim ersten Login in der neuen LXC aufällt -- da käme man
+  # sonst gar nicht mehr rein.
+  local prompt="$1"
+  local pw1 pw2
+  while true; do
+    read -r -s -p "$prompt: " pw1
+    echo
+    if [ -z "$pw1" ]; then
+      echo "Passwort darf nicht leer sein." >&2
+      continue
+    fi
+    read -r -s -p "$prompt (Wiederholung): " pw2
+    echo
+    if [ "$pw1" != "$pw2" ]; then
+      echo "Passwörter stimmen nicht überein -- nochmal." >&2
+      continue
+    fi
+    REPLY="$pw1"
+    return
+  done
+}
+
 find_ubuntu_template() {
   # Sucht das neueste verfügbare Ubuntu-26.04-Template statt einen
   # konkreten Dateinamen zu hardcoden (die ändern sich mit jedem
@@ -120,12 +145,8 @@ main() {
   ask "CPU-Kerne" "2"
   local cores="$REPLY"
 
-  ask "Root-Passwort für die LXC" ""
+  ask_password "Root-Passwort für die LXC"
   local root_password="$REPLY"
-  if [ -z "$root_password" ]; then
-    echo "Root-Passwort ist erforderlich." >&2
-    exit 1
-  fi
 
   echo ""
   echo "Suche verfügbares Ubuntu-26.04-Template..."
