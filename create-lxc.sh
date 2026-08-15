@@ -26,6 +26,13 @@ require_pve() {
   fi
 }
 
+is_yes() {
+  case "${1,,}" in
+    j | ja | y | yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ask() {
   # ask "Frage" "Default" -> setzt REPLY
   local prompt="$1" default="${2:-}"
@@ -72,12 +79,33 @@ main() {
 
   local gateway=""
   if [ -n "$ip_cidr" ]; then
-    ask "Gateway (z.B. 192.168.1.1)" ""
+    # Echter Bug, live gefunden: der Gateway-Prompt hatte früher keinen
+    # Default, und ein leer gelassenes Feld führte dazu, dass "gw=" im
+    # net0-String komplett fehlte -- der Container bekam eine feste IP
+    # OHNE Standardroute, also kein Internetzugang, obwohl "pct create"
+    # anstandslos durchlief. Jetzt ein sinnvoller Vorschlag aus der
+    # eingegebenen IP (x.x.x.1, die in den allermeisten Heim-/Büro-
+    # Netzen übliche Gateway-Adresse) statt eines leeren Defaults --
+    # Enter drücken reicht jetzt, außer die echte Gateway-IP weicht ab.
+    local suggested_gw
+    suggested_gw="$(echo "$ip_cidr" | sed -E 's#^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/.*#\1.1#')"
+    ask "Gateway" "$suggested_gw"
     gateway="$REPLY"
+    if [ -z "$gateway" ]; then
+      echo "Gateway darf bei einer festen IP nicht leer sein (sonst kein Internetzugang im Container)." >&2
+      exit 1
+    fi
   fi
 
   ask "Netzwerk-Bridge" "vmbr0"
   local bridge="$REPLY"
+
+  local default_dns="8.8.8.8"
+  if [ -f /etc/resolv.conf ]; then
+    default_dns="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null || echo "8.8.8.8")"
+  fi
+  ask "DNS-Server" "$default_dns"
+  local nameserver="$REPLY"
 
   ask "Storage-Pool (für Rootfs)" "local-lvm"
   local storage="$REPLY"
@@ -120,7 +148,7 @@ main() {
   local net0="name=eth0,bridge=${bridge}"
   if [ -n "$ip_cidr" ]; then
     net0="${net0},ip=${ip_cidr}"
-    [ -n "$gateway" ] && net0="${net0},gw=${gateway}"
+    net0="${net0},gw=${gateway}"
   else
     net0="${net0},ip=dhcp"
   fi
@@ -130,12 +158,13 @@ main() {
   echo "  VMID:      $vmid"
   echo "  Hostname:  $hostname"
   echo "  Netzwerk:  $net0"
+  echo "  DNS:       $nameserver"
   echo "  Storage:   $storage (${disk_gb}GB)"
   echo "  RAM/CPU:   ${memory}MB / ${cores} Kerne"
   echo "  Template:  $template"
   echo ""
-  ask "Anlegen? (ja/nein)" "ja"
-  if [ "$REPLY" != "ja" ]; then
+  ask "Anlegen? (j/ja/y/yes zum Bestätigen)" "ja"
+  if ! is_yes "$REPLY"; then
     echo "Abgebrochen."
     exit 0
   fi
@@ -148,6 +177,7 @@ main() {
   pct create "$vmid" "$template" \
     --hostname "$hostname" \
     --net0 "$net0" \
+    --nameserver "$nameserver" \
     --rootfs "${storage}:${disk_gb}" \
     --memory "$memory" \
     --cores "$cores" \
@@ -159,7 +189,7 @@ main() {
   echo "Starte LXC..."
   pct start "$vmid"
 
-  echo "Warte auf Netzwerk..."
+  echo "Warte, bis die LXC reagiert..."
   for _ in $(seq 1 30); do
     if pct exec "$vmid" -- true 2>/dev/null; then
       break
@@ -167,9 +197,32 @@ main() {
     sleep 2
   done
 
-  # apt-Cache in einer frischen LXC ist oft leer/veraltet -- curl für
-  # Skript 2 sicherstellen.
-  pct exec "$vmid" -- bash -c "apt-get update -qq && apt-get install -y -qq curl" || true
+  # "pct exec -- true" prüft nur, ob der Container selbst läuft, NICHT
+  # ob das Netzwerk (Gateway/DNS) tatsächlich funktioniert -- genau der
+  # Fall, der live zum "kann nichts laden"-Bug geführt hat, wäre hier
+  # anstandslos durchgelaufen. Echten Konnektivitätstest nachschalten,
+  # mit klarer Fehlermeldung statt eines stillen apt-get-Timeouts weiter
+  # unten.
+  echo "Prüfe Internetzugang im Container..."
+  local network_ok=0
+  for _ in $(seq 1 15); do
+    if pct exec "$vmid" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+      network_ok=1
+      break
+    fi
+    sleep 2
+  done
+  if [ "$network_ok" -ne 1 ]; then
+    echo "" >&2
+    echo "WARNUNG: Der Container hat nach 30s immer noch keinen Internetzugang." >&2
+    echo "Prüfen: pct exec $vmid -- ping -c1 ${gateway:-<gateway>}" >&2
+    echo "        pct exec $vmid -- cat /etc/resolv.conf" >&2
+    echo "Skript 2 (install-regobase.sh) wird trotzdem fehlschlagen, bis das behoben ist." >&2
+    echo "" >&2
+  fi
+
+  echo "Aktualisiere Paketlisten und installierte Pakete..."
+  pct exec "$vmid" -- bash -c "apt-get update -qq && apt-get -y -qq upgrade && apt-get install -y -qq curl"
 
   local lxc_ip
   lxc_ip="$(pct exec "$vmid" -- hostname -I 2>/dev/null | awk '{print $1}')"
