@@ -89,6 +89,78 @@ find_ubuntu_template() {
   echo "$tmpl"
 }
 
+setup_usb_passthrough() {
+  # ELDAT-USB-Stick (Easywave-Funk-Dongle) in die LXC durchreichen --
+  # REGObase/regoeldat_core spricht ihn über pyserial an
+  # (serial.tools.list_ports.comports(), sucht/probiert alle /dev/tty*
+  # der Reihe nach durch, siehe regoeldat_core/eldat/discovery.py), es
+  # kommt also nur darauf an, dass IRGENDEIN passender /dev/tty*-Knoten
+  # in der LXC existiert -- kein bestimmter Pfad/Name nötig.
+  #
+  # NICHT gegen echtes Proxmox getestet (wie das ganze Skript). Nutzt
+  # `pct set -devX`, das moderne, native Geräte-Passthrough für
+  # unprivilegierte Container (Proxmox VE 8+) -- auf älteren Proxmox-
+  # Versionen ggf. stattdessen von Hand über
+  # /etc/pve/lxc/<vmid>.conf's lxc.cgroup2.devices.allow +
+  # lxc.mount.entry nötig.
+  local vmid="$1"
+
+  ask "USB-Passthrough für den ELDAT-Stick einrichten? (j/ja/y/yes)" "nein"
+  if ! is_yes "$REPLY"; then
+    return 0
+  fi
+
+  echo ""
+  echo "Verfügbare USB-Seriell-Geräte auf diesem Proxmox-Host:"
+  local by_id_dir="/dev/serial/by-id"
+  local -a devices=()
+  if [ -d "$by_id_dir" ]; then
+    while IFS= read -r -d '' dev; do
+      devices+=("$dev")
+    done < <(find "$by_id_dir" -maxdepth 1 -type l -print0 2>/dev/null)
+  fi
+  if [ "${#devices[@]}" -eq 0 ]; then
+    # Fallback ohne stabile by-id-Symlinks (z.B. sehr generischer
+    # USB-Seriell-Chip ohne eigene Seriennummer) -- direkt die
+    # ttyUSB*/ttyACM*-Knoten anbieten. Weniger robust über einen
+    # Host-Neustart/Neu-Einstecken hinweg, aber besser als gar keine
+    # Option zu haben.
+    while IFS= read -r -d '' dev; do
+      devices+=("$dev")
+    done < <(find /dev -maxdepth 1 \( -name 'ttyUSB*' -o -name 'ttyACM*' \) -print0 2>/dev/null)
+  fi
+
+  if [ "${#devices[@]}" -eq 0 ]; then
+    echo "Kein USB-Seriell-Gerät gefunden. Stick eingesteckt? Später manuell:"
+    echo "  pct set $vmid -dev0 /dev/ttyUSBx"
+    return 0
+  fi
+
+  local i=1
+  for dev in "${devices[@]}"; do
+    echo "  $i) $dev"
+    i=$((i + 1))
+  done
+  ask "Welches Gerät? (Nummer)" "1"
+  local choice="$REPLY"
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#devices[@]}" ]; then
+    echo "Ungültige Auswahl, überspringe USB-Passthrough." >&2
+    return 0
+  fi
+  local chosen="${devices[$((choice - 1))]}"
+
+  # by-id-Symlink auf den echten Geräteknoten auflösen (z.B.
+  # /dev/ttyUSB0) -- pct set trägt den Pfad 1:1 in die Container-
+  # Konfiguration ein, ohne dass in der LXC selbst zwingend udev läuft,
+  # das den by-id-Symlink dort neu erzeugen würde.
+  local resolved
+  resolved="$(readlink -f "$chosen")"
+  echo "Reiche $resolved ($chosen) an LXC $vmid durch..."
+  pct set "$vmid" -dev0 "$resolved"
+  echo "Fertig -- in der LXC sollte $resolved jetzt existieren (Setup > ELDAT in REGObase zum Prüfen/Auswählen)."
+  echo "Falls nicht sofort sichtbar: pct exec $vmid -- ls -la $resolved -- notfalls hilft ein 'pct reboot $vmid'."
+}
+
 main() {
   require_pve
 
@@ -246,6 +318,8 @@ main() {
 
   echo "Aktualisiere Paketlisten und installierte Pakete..."
   pct exec "$vmid" -- bash -c "apt-get update -qq && apt-get -y -qq upgrade && apt-get install -y -qq curl"
+
+  setup_usb_passthrough "$vmid"
 
   echo "Richte die Port-80-Weboberfläche ein (nur die Oberfläche, REGObase"
   echo "selbst installierst du danach per Klick im Browser)..."

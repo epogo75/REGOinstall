@@ -13,10 +13,22 @@ bash create-lxc.sh
 
 Fragt interaktiv nach VMID (Default 300), IP, Gateway (Vorschlag aus der
 IP abgeleitet, x.x.x.1), DNS, Storage etc., legt eine Ubuntu-26.04-LXC
-an, aktualisiert sie (`apt update && apt upgrade`) und richtet am Ende
-automatisch die Port-80-Weboberfläche ein (`bootstrap-port80.sh`,
+an, aktualisiert sie (`apt update && apt upgrade`), bietet optional
+USB-Passthrough für den ELDAT-Stick an (siehe unten) und richtet am
+Ende automatisch die Port-80-Weboberfläche ein (`bootstrap-port80.sh`,
 läuft innerhalb der neuen LXC). **Noch nicht gegen ein echtes Proxmox
 getestet** -- vor dem produktiven Einsatz einmal durchgehen.
+
+**ELDAT-USB-Passthrough:** REGObase spricht den Easywave-Stick über
+pyserial an (`serial.tools.list_ports.comports()`, probiert alle
+`/dev/tty*` durch -- kein fester Pfad/Name nötig). `create-lxc.sh`
+listet die per `/dev/serial/by-id/` stabil identifizierten USB-
+Seriell-Geräte des Proxmox-Hosts auf, löst den gewählten Symlink zum
+echten Geräteknoten auf (z.B. `/dev/ttyUSB0`) und reicht ihn per
+`pct set <vmid> -dev0 ...` durch (natives Proxmox-VE-8+-Passthrough,
+kein manuelles `lxc.cgroup2.devices.allow` nötig). Falls das Gerät
+nach dem Durchreichen nicht sofort in der LXC sichtbar ist, hilft ein
+`pct reboot <vmid>`.
 
 Am Ende gibt das Skript die IP der neuen LXC aus -- im Browser öffnen.
 
