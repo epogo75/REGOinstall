@@ -44,6 +44,9 @@
 
 set -euo pipefail
 
+REGOINSTALL_VERSION="0.1"
+REGOINSTALL_BUILD="2026-08-15.1"
+
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/regobase-stack}"
 GH_ORG="epogo75"
 REPOS=(REGObase REGOcore regoeldat-core)
@@ -51,6 +54,8 @@ NODE_MAJOR="24"
 BACKEND_PORT="${REGOBASE_PORT:-8002}"
 FRONTEND_PORT="${REGOBASE_FRONTEND_PORT:-5175}"
 REGOINSTALL_RAW_BASE="https://raw.githubusercontent.com/${GH_ORG}/REGOinstall/main"
+
+echo "REGOinstall v${REGOINSTALL_VERSION} (build ${REGOINSTALL_BUILD}) -- install-regobase.sh"
 
 log() { echo "==> $*"; }
 
@@ -123,10 +128,20 @@ ensure_gh_auth() {
 }
 
 clone_repos() {
+  # Bei einem erneuten Lauf (fehlgeschlagener erster Versuch, oder
+  # dieses Skript wurde inzwischen erneut ausgelöst) NICHT nur prüfen ob
+  # der Ordner existiert und dann überspringen -- ein echter Fall live
+  # gefunden: der erste Versuch klonte REGObase vor einem Push neuer
+  # Commits (u.a. matterbridge-regobase/), ein zweiter Klick auf
+  # "Installation starten" sah ".git existiert" und übersprang das
+  # Klonen komplett, der Checkout blieb dauerhaft auf dem alten Stand
+  # hängen, obwohl GitHub längst aktueller war. Jetzt: schon vorhanden
+  # -> pull statt überspringen.
   mkdir -p "$INSTALL_ROOT"
   for repo in "${REPOS[@]}"; do
     if [ -d "$INSTALL_ROOT/$repo/.git" ]; then
-      log "$repo schon vorhanden, überspringe Klonen."
+      log "$repo schon vorhanden, hole aktuellen Stand..."
+      (cd "$INSTALL_ROOT/$repo" && git pull --ff-only)
     else
       log "Klone $repo..."
       gh repo clone "$GH_ORG/$repo" "$INSTALL_ROOT/$repo"
@@ -255,6 +270,7 @@ EOF
   cat > /etc/regoinstall/config.json <<EOF
 {
   "auth_db": "${INSTALL_ROOT}/REGObase/backend/data/regobase.db",
+  "connect_github_cmd": ["bash", "-c", "curl -fsSL ${REGOINSTALL_RAW_BASE}/install-regobase.sh | bash -s -- --connect-github"],
   "install_cmd": ["bash", "-c", "curl -fsSL ${REGOINSTALL_RAW_BASE}/install-regobase.sh | bash"]
 }
 EOF
@@ -342,6 +358,19 @@ main() {
 
   if [ "${1:-}" = "--update" ]; then
     do_update
+    exit 0
+  fi
+
+  if [ "${1:-}" = "--connect-github" ]; then
+    # Eigener, schneller erster Schritt für die Port-80-Oberfläche
+    # (direkter Nutzerwunsch: "Der Github Login als erstes - bevor man
+    # irgendwas startet") -- installiert nur die gh-CLI und meldet an,
+    # macht sonst nichts. install-regobase.sh selbst (ohne Flag) prüft
+    # danach über ensure_gh_auth() ohnehin zuerst, ob schon angemeldet
+    # ist, und überspringt den Login dann automatisch.
+    install_gh_cli
+    ensure_gh_auth
+    log "GitHub verbunden."
     exit 0
   fi
 

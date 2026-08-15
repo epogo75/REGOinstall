@@ -19,6 +19,10 @@
 
 set -euo pipefail
 
+REGOINSTALL_VERSION="0.1"
+REGOINSTALL_BUILD="2026-08-15.1"
+echo "REGOinstall v${REGOINSTALL_VERSION} (build ${REGOINSTALL_BUILD}) -- create-lxc.sh"
+
 require_pve() {
   if ! command -v pct >/dev/null 2>&1; then
     echo "Kein 'pct' gefunden -- dieses Skript muss auf dem Proxmox-Host laufen, nicht in einem Container." >&2

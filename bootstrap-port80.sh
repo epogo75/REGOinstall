@@ -12,7 +12,11 @@
 
 set -euo pipefail
 
+REGOINSTALL_VERSION="0.1"
+REGOINSTALL_BUILD="2026-08-15.1"
 REGOINSTALL_RAW_BASE="https://raw.githubusercontent.com/epogo75/REGOinstall/main"
+
+echo "REGOinstall v${REGOINSTALL_VERSION} (build ${REGOINSTALL_BUILD}) -- bootstrap-port80.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Bitte als root ausführen." >&2
@@ -40,6 +44,7 @@ if [ ! -f /etc/regoinstall/config.json ]; then
   cat > /etc/regoinstall/config.json <<EOF
 {
   "auth_db": null,
+  "connect_github_cmd": ["bash", "-c", "curl -fsSL ${REGOINSTALL_RAW_BASE}/install-regobase.sh | bash -s -- --connect-github"],
   "install_cmd": ["bash", "-c", "curl -fsSL ${REGOINSTALL_RAW_BASE}/install-regobase.sh | bash"]
 }
 EOF

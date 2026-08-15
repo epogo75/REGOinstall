@@ -52,15 +52,22 @@ zeigt auf eine existierende Datei oder nicht):
 - NICHT installiert (frische LXC, bootstrap-port80.sh lief, aber noch
   kein REGObase): "auth_db" ist null. Die Seite ist absichtlich OHNE
   Basic-Auth erreichbar -- der echte Türsteher ist `gh auth login`'s
-  Device-Code-Flow innerhalb des Installations-Jobs selbst (privates
-  REGObase-Repo, nur der rechtmäßige GitHub-Besitzer kann den
-  angezeigten Code auf github.com/login/device bestätigen). Eine echte
-  GitHub-OAuth-App mit fester Callback-URL wurde bewusst NICHT gebaut
-  -- das würde pro LXC eine andere IP/Callback-Registrierung brauchen,
-  passt nicht zu "soll auf jedem frisch erzeugten Container funktionieren".
-  "Installieren"-Knopf POSTet auf /install, das führt config.json's
-  "install_cmd" (curl | bash von install-regobase.sh) als Hintergrund-
-  Job aus, exakt derselbe Job-Runner/Log-Viewer wie Update/Backup.
+  Device-Code-Flow, aber als eigener, ERSTER Schritt (direkter
+  Nutzerwunsch: "Der Github Login als erstes - bevor man irgendwas
+  startet", nachdem die ursprüngliche Version den Code mitten in einem
+  langen Installations-Log versteckte). "Mit GitHub anmelden"-Knopf
+  POSTet auf /connect-github (config.json's "connect_github_cmd" --
+  installiert nur die gh-CLI + `gh auth login`, sonst nichts). Erst
+  wenn gh_auth_status() danach True liefert, zeigt die Seite den
+  "Installation starten"-Knopf (POST /install, config.json's
+  "install_cmd"). Eine echte GitHub-OAuth-App mit fester Callback-URL
+  wurde bewusst NICHT gebaut -- das würde pro LXC eine andere IP/
+  Callback-Registrierung brauchen, passt nicht zu "soll auf jedem
+  frisch erzeugten Container funktionieren". Beide Knöpfe laufen über
+  denselben Job-Runner (run_job_async) wie Update/Backup, mit einem
+  live per JS pollendem Log-Fenster direkt auf der Seite (kein
+  manuelles Neuladen mehr, direkter Nutzerwunsch) statt nur einem Link
+  auf eine separate /log-Seite.
 - Installiert: "auth_db" zeigt auf die echte regobase.db. Ab hier normale
   Basic-Auth gegen die users-Tabelle (siehe oben), Update/Backup/Restore-
   Karten statt der Installations-Seite.
@@ -70,6 +77,7 @@ install-regobase.sh am Ende aktualisiert):
 
 {
   "auth_db": null,
+  "connect_github_cmd": ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/install-regobase.sh | bash -s -- --connect-github"],
   "install_cmd": ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/install-regobase.sh | bash"]
 }
 """
@@ -85,6 +93,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Von Hand hochgezählt bei jeder inhaltlichen Änderung (direkter
+# Nutzerwunsch, nach mehrfacher Verwirrung darüber, ob eine frische LXC
+# wirklich schon den neuesten Stand hat) -- BUILD ist das Datum/die
+# laufende Nummer des jeweiligen Edits, sichtbar im Seitenkopf jeder
+# Seite, damit sich "läuft hier wirklich die Version, die ich denke"
+# ohne journalctl-Grabbelei beantworten lässt.
+VERSION = "0.1"
+BUILD = "2026-08-15.1"
+
 APPS_CONFIG = Path("/etc/regoinstall/apps.json")
 CONFIG = Path("/etc/regoinstall/config.json")
 LOG_DIR = Path("/var/log/regoinstall")
@@ -97,8 +114,27 @@ BACKUP_DIR.chmod(0o700)  # enthält irgendwann Kopien von /etc/regobase.env
 
 _job_lock = threading.Lock()
 _job_running = False
+_job_name: str | None = None
 _hasher = None
 _dummy_hash = None
+
+
+def gh_auth_status() -> tuple[bool, str | None]:
+    """(angemeldet?, GitHub-Login-Name oder None). `gh` existiert vor der
+    Installation noch nicht (bootstrap-port80.sh installiert nur
+    python3+curl) -- fehlender Befehl zählt als "nicht angemeldet",
+    kein Fehler."""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    login = result.stdout.strip()
+    return (True, login) if login else (False, None)
 
 
 def _get_hasher():
@@ -204,11 +240,12 @@ def check_auth(header: str | None) -> bool:
 
 
 def run_job_async(name: str, cmd: list[str]) -> bool:
-    global _job_running
+    global _job_running, _job_name
     with _job_lock:
         if _job_running:
             return False
         _job_running = True
+        _job_name = name
 
     log_path = LOG_DIR / f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}.log"
 
@@ -341,24 +378,61 @@ def _page(title: str, body: str) -> str:
 <style>{PAGE_STYLE}</style>
 </head><body>
 {body}
+<p style="margin-top:2rem;color:#999;font-size:0.75rem;">REGOinstall v{html.escape(VERSION)} (build {html.escape(BUILD)})</p>
 </body></html>"""
 
 
+# Direct request: "würde ich immer gerne in einem Log Fenster sehen, was
+# gerade läuft" -- kein manuelles Neuladen mehr, ein eingebettetes <pre>
+# pollt /log-content per fetch() alle 1.5s und scrollt automatisch mit.
+# Bewusst reines Vanilla-JS (kein Framework), das <pre> ist beim ersten
+# Laden schon server-seitig mit dem aktuellen Log gefüllt, funktioniert
+# also auch ganz ohne JS (nur eben ohne Live-Aktualisierung).
+def _live_log_block() -> str:
+    log_text = html.escape(latest_log())
+    return f"""<pre id="log" style="background:#111;color:#ddd;padding:0.8rem;max-height:400px;overflow:auto;border-radius:8px;">{log_text}</pre>
+<script>
+async function pollLog() {{
+  try {{
+    const res = await fetch('/log-content');
+    if (res.ok) {{
+      const text = await res.text();
+      const el = document.getElementById('log');
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
+      el.textContent = text;
+      if (atBottom) el.scrollTop = el.scrollHeight;
+    }}
+  }} catch (e) {{}}
+  setTimeout(pollLog, 1500);
+}}
+pollLog();
+</script>"""
+
+
 def render_install_page() -> str:
-    running = _job_running
-    if running:
-        body = """<h1>REGObase wird installiert…</h1>
-<p>Läuft im Hintergrund. Der Log zeigt u.a. den GitHub-Anmeldecode
-(gh auth login, privates Repo) -- den Code auf
+    if _job_running:
+        job_label = {"connect-github": "GitHub-Anmeldung", "install": "Installation"}.get(_job_name, _job_name or "Job")
+        body = f"""<h1>{html.escape(job_label)} läuft…</h1>
+<p>Bei der GitHub-Anmeldung erscheint hier ein Code + ein Link zu
 <a href="https://github.com/login/device" target="_blank">github.com/login/device</a>
-eingeben, dann läuft die Installation automatisch weiter.</p>
-<p><a href="/log">Log ansehen (Seite neu laden für Fortschritt)</a></p>"""
-    else:
+-- dort bestätigen, dann läuft es automatisch weiter.</p>
+{_live_log_block()}"""
+        return _page("REGOinstall", body)
+
+    gh_ok, gh_login = gh_auth_status()
+    if not gh_ok:
         body = """<h1>REGObase installieren</h1>
-<p>Noch nicht installiert. Ein Klick startet die komplette Installation
-(Docker, Matterbridge, REGObase selbst) im Hintergrund -- dabei wird
-`gh auth login` für die privaten REGObase-Repos aufgerufen, der Code
-dafür erscheint danach im Log.</p>
+<p>Erster Schritt: mit GitHub anmelden (REGObase/REGOcore/regoeldat-core
+sind private Repos). Ein Klick zeigt einen Code + Link -- der muss auf
+github.com/login/device bestätigt werden.</p>
+<form method="post" action="/connect-github">
+  <button type="submit">Mit GitHub anmelden</button>
+</form>"""
+    else:
+        body = f"""<h1>REGObase installieren</h1>
+<p>✓ Mit GitHub angemeldet als <strong>{html.escape(gh_login or '')}</strong>.</p>
+<p>Ein Klick startet die komplette Installation (Docker, Matterbridge,
+REGObase selbst) im Hintergrund.</p>
 <form method="post" action="/install">
   <button type="submit">Installation starten</button>
 </form>"""
@@ -458,7 +532,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_html(render_index() if is_installed() else render_install_page())
         elif path == "/log":
-            self._send_html(_page("Log", f"<pre>{html.escape(latest_log())}</pre><p><a href='/'>Zurück</a></p>"))
+            self._send_html(_page("Log", f"{_live_log_block()}<p><a href='/'>Zurück</a></p>"))
+        elif path == "/log-content":
+            # Reines Text-Endpunkt für das JS-Polling in _live_log_block()
+            # -- kein HTML drumherum, damit fetch() den Log-Inhalt direkt
+            # als Text bekommt.
+            encoded = latest_log().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
         elif path.startswith("/restore/"):
             idx = self._parse_index(path, "/restore/")
             if idx is None:
@@ -530,8 +614,37 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         apps = load_apps()
 
+        if path == "/connect-github":
+            if is_installed():
+                self._redirect("/")
+                return
+            gh_ok, _ = gh_auth_status()
+            if gh_ok:
+                self._redirect("/")
+                return
+            connect_cmd = load_config().get("connect_github_cmd")
+            if not connect_cmd:
+                self._send_html(
+                    _page("Install", "<p>connect_github_cmd fehlt in /etc/regoinstall/config.json.</p>"), status=500
+                )
+                return
+            started = run_job_async("connect-github", connect_cmd)
+            if not started:
+                self._send_html("<p>Läuft schon. <a href='/log'>Log ansehen</a></p>")
+                return
+            self._redirect("/log")
+            return
+
         if path == "/install":
             if is_installed():
+                self._redirect("/")
+                return
+            gh_ok, _ = gh_auth_status()
+            if not gh_ok:
+                # Direkter Zugriff auf /install ohne vorherige GitHub-
+                # Anmeldung (z.B. Lesezeichen, doppelter Tab) -- zurück
+                # zur Startseite statt einer Installation, die sowieso
+                # gleich am fehlenden gh-Login hängen bliebe.
                 self._redirect("/")
                 return
             install_cmd = load_config().get("install_cmd")
@@ -599,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"REGOinstall-Oberfläche läuft auf Port {PORT}")
+    print(f"REGOinstall v{VERSION} (build {BUILD}) läuft auf Port {PORT}")
     server.serve_forever()
 
 
