@@ -115,16 +115,23 @@ install_gh_cli() {
 }
 
 ensure_gh_auth() {
-  if gh auth status >/dev/null 2>&1; then
-    return
+  if ! gh auth status >/dev/null 2>&1; then
+    if [ -n "${GH_TOKEN:-}" ]; then
+      log "Verwende GH_TOKEN aus der Umgebung für gh-Auth."
+      echo "$GH_TOKEN" | gh auth login --with-token
+    else
+      log "GitHub-Login nötig (private Repos) -- bitte den Anweisungen folgen:"
+      gh auth login
+    fi
   fi
-  if [ -n "${GH_TOKEN:-}" ]; then
-    log "Verwende GH_TOKEN aus der Umgebung für gh-Auth."
-    echo "$GH_TOKEN" | gh auth login --with-token
-    return
-  fi
-  log "GitHub-Login nötig (private Repos) -- bitte den Anweisungen folgen:"
-  gh auth login
+  # Echter Bug, live gefunden: `gh auth login` (Device-Flow, ohne TTY)
+  # richtet NICHT automatisch den Git-Credential-Helper ein --
+  # "gh repo clone" funktioniert trotzdem (nutzt gh's eigene Auth direkt),
+  # aber rohes "git fetch"/"git pull" (siehe clone_repos()/do_update())
+  # scheitert dann mit "could not read Username for 'https://github.com'".
+  # Idempotent, deshalb hier unbedingt (nicht nur im frisch-eingeloggt-
+  # Zweig oben) -- muss auch stimmen, wenn gh schon vorher angemeldet war.
+  gh auth setup-git
 }
 
 clone_repos() {
@@ -245,10 +252,15 @@ install_update_service() {
   mkdir -p /opt/regoinstall /etc/regoinstall
   curl -fsSL "${REGOINSTALL_RAW_BASE}/update-service/regoinstall_updater.py" -o /opt/regoinstall/regoinstall_updater.py
 
-  if [ ! -f /etc/regoinstall/apps.json ]; then
-    local ip
-    ip="$(hostname -I | awk '{print $1}')"
-    cat > /etc/regoinstall/apps.json <<EOF
+  # Immer überschreiben, nicht nur wenn fehlend -- exakt derselbe Bug wie
+  # bei config.json unten, live gefunden: bootstrap-port80.sh legt diese
+  # Datei schon VOR der eigentlichen Installation mit "[]" an (leere
+  # Kartenliste), ein "nur falls fehlend"-Guard hier hätte das für immer
+  # so belassen, obwohl REGObase danach echt lief -- Login hätte
+  # funktioniert, aber die Seite wäre dauerhaft leer geblieben.
+  local ip
+  ip="$(hostname -I | awk '{print $1}')"
+  cat > /etc/regoinstall/apps.json <<EOF
 [
   {
     "name": "REGObase",
@@ -260,7 +272,6 @@ install_update_service() {
   }
 ]
 EOF
-  fi
 
   # Immer überschreiben, nicht nur wenn fehlend -- bootstrap-port80.sh
   # legt diese Datei schon VOR der eigentlichen Installation mit

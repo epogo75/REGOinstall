@@ -86,6 +86,7 @@ import base64
 import html
 import io
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -237,9 +238,17 @@ def check_auth(header: str | None) -> bool:
     if not is_active or role != "ADMIN":
         return False
     try:
-        return hasher.verify(password_hash, password)
+        ok = hasher.verify(password_hash, password)
     except (VerifyMismatchError, InvalidHash):
         return False
+    if ok:
+        global _pending_first_login
+        _pending_first_login = None  # einmal erfolgreich eingeloggt, Hinweis nicht mehr nötig
+    return ok
+
+
+_pending_first_login: str | None = None
+_FIRST_LOGIN_RE = re.compile(r"Erstinstallations-Admin-Login:\s*(\S+)\s*/\s*(\S+)")
 
 
 def run_job_async(name: str, cmd: list[str]) -> bool:
@@ -253,10 +262,28 @@ def run_job_async(name: str, cmd: list[str]) -> bool:
     log_path = LOG_DIR / f"{name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}.log"
 
     def _run():
-        global _job_running
+        global _job_running, _pending_first_login
         try:
             with log_path.open("wb") as f:
                 subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=False)
+            if name == "install":
+                # Direkter Nutzerwunsch, nach einem echten Vorfall: das
+                # generierte Admin-Passwort stand bisher NUR in diesem
+                # Log -- ein abgebrochener/verpasster Log-Blick (genau
+                # live passiert) bedeutete dauerhaften Ausschluss, ohne
+                # SSH-Zugriff auf die Box nicht wiederherstellbar (argon2-
+                # Hash in der DB ist nicht umkehrbar). Jetzt zusätzlich
+                # in _pending_first_login gemerkt -- render_install_page()
+                # zeigt es EINMALIG groß+kopierbar an, unauthentifiziert
+                # (dieselbe Begründung wie is_installed()'s eigener
+                # Auth-Bypass: das ist genau das Zeitfenster, bevor der
+                # Nutzer das erste Mal etwas zum Einloggen hat). Bewusst
+                # NICHT persistiert (kein Neustart-Überleben) und wird
+                # beim ersten erfolgreichen echten Login automatisch
+                # gelöscht (siehe check_auth()).
+                match = _FIRST_LOGIN_RE.search(log_path.read_text(errors="replace"))
+                if match:
+                    _pending_first_login = f"{match.group(1)} / {match.group(2)}"
         finally:
             with _job_lock:
                 _job_running = False
@@ -538,6 +565,35 @@ REGObase selbst) im Hintergrund.</p>
     return _page("REGOinstall", body)
 
 
+def render_first_login_page() -> str:
+    # Direkter Nutzerwunsch nach einem echten Vorfall: das generierte
+    # Admin-Passwort stand bisher nur im Installations-Log -- ein
+    # verpasster/abgebrochener Blick dorthin bedeutete dauerhaften
+    # Ausschluss (argon2-Hash in der DB ist nicht umkehrbar, nur per
+    # SSH+direktem DB-Zugriff zu umgehen). Diese Seite ist absichtlich
+    # ungeschützt erreichbar, aber nur solange das Passwort noch nie
+    # erfolgreich benutzt wurde (siehe _require_auth()/check_auth()).
+    creds = html.escape(_pending_first_login or "")
+    body = f"""<h1>Installation abgeschlossen</h1>
+<div class="card" style="background:#eef6ff;border-color:#9cf;">
+  <p>Dein Admin-Login (nur dieses eine Mal hier sichtbar -- notieren!):</p>
+  <code id="creds" style="font-size:1.3rem;font-weight:700;">{creds}</code>
+  <button type="button" onclick="copyCreds()">Kopieren</button>
+  <span id="copyStatus" class="muted"></span>
+</div>
+<p><a href="/">Weiter zum Login</a></p>
+<script>
+function copyCreds() {{
+  navigator.clipboard.writeText(document.getElementById('creds').textContent).then(() => {{
+    const s = document.getElementById('copyStatus');
+    s.textContent = 'kopiert!';
+    setTimeout(() => {{ s.textContent = ''; }}, 2000);
+  }});
+}}
+</script>"""
+    return _page("Installation abgeschlossen", body)
+
+
 def render_index() -> str:
     apps = load_apps()
     running = "Ja" if _job_running else "Nein"
@@ -569,8 +625,22 @@ def render_index() -> str:
           <ul>{backup_list}</ul>
         </div>
         """)
+    gh_ok, gh_login = gh_auth_status()
+    github_status = (
+        f"✓ Verbunden als <strong>{html.escape(gh_login or '')}</strong>" if gh_ok else "✗ Nicht verbunden"
+    )
+    github_card = f"""
+    <div class="card">
+      <h2>GitHub</h2>
+      <p>{github_status}</p>
+      <form method="post" action="/connect-github">
+        <button type="submit">{"Neu verbinden" if gh_ok else "Mit GitHub verbinden"}</button>
+      </form>
+    </div>"""
+
     body = f"""<h1>REGOinstall</h1>
 <p>Läuft gerade ein Job? {running} -- <a href="/log">Log ansehen</a></p>
+{github_card}
 {''.join(rows)}"""
     return _page("REGOinstall", body)
 
@@ -627,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("WWW-Authenticate", 'Basic realm="REGOinstall"')
         self.end_headers()
 
-    def _require_auth(self) -> bool:
+    def _require_auth(self, path: str) -> bool:
         if not is_installed():
             # Vor der ersten Installation gibt es noch keine REGObase-
             # Benutzer-DB gegen die geprüft werden könnte -- der echte
@@ -636,6 +706,21 @@ class Handler(BaseHTTPRequestHandler):
             # Docstring-Kommentar).
             return True
         if check_auth(self.headers.get("Authorization")):
+            # Echte Anmeldung geht immer vor -- auch auf "/" und
+            # "/first-login" selbst, sonst würde ein Login-Versuch über "/"
+            # nie bei check_auth() ankommen und _pending_first_login (das
+            # dort bei Erfolg gelöscht wird) bliebe für immer gesetzt.
+            return True
+        if path in ("/first-login", "/") and _pending_first_login is not None:
+            # Direkter Nutzerwunsch, nach einem echten Vorfall (Passwort
+            # nur im Log, Log verpasst, dauerhaft ausgesperrt): diese beiden
+            # Routen bleiben ohne gültige Anmeldung erreichbar, aber NUR
+            # solange das generierte Passwort noch nie erfolgreich benutzt
+            # wurde (siehe oben). "/" muss mit rein, sonst bekäme der Nutzer
+            # beim ersten Aufruf nach der Installation sofort einen
+            # Basic-Auth-Dialog (kein gecachtes Passwort!) statt der
+            # Weiterleitung zu /first-login -- genau der Fall, den diese
+            # Seite lösen soll.
             return True
         self._unauthorized()
         return False
@@ -654,10 +739,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if not self._require_auth():
-            return
         path = urlparse(self.path).path
-        if path == "/":
+        if not self._require_auth(path):
+            return
+        if path == "/first-login":
+            if _pending_first_login is None:
+                self._redirect("/")
+                return
+            self._send_html(render_first_login_page())
+        elif path == "/":
+            if is_installed() and _pending_first_login is not None:
+                self._redirect("/first-login")
+                return
             self._send_html(render_index() if is_installed() else render_install_page())
         elif path == "/log":
             self._send_html(_page("Log", f"{_live_log_block()}<p><a href='/'>Zurück</a></p>"))
@@ -712,9 +805,9 @@ class Handler(BaseHTTPRequestHandler):
         # BaseHTTPRequestHandler only implements do_GET/do_POST by
         # default -- without this, any HEAD request (health checks,
         # `curl -I`) gets a bare 501 instead of the real status/headers.
-        if not self._require_auth():
-            return
         path = urlparse(self.path).path
+        if not self._require_auth(path):
+            return
         if path in ("/", "/log"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -753,24 +846,26 @@ class Handler(BaseHTTPRequestHandler):
         return idx if 0 <= idx < len(apps) else None
 
     def do_POST(self):
-        if not self._require_auth():
+        path = urlparse(self.path).path
+        if not self._require_auth(path):
             return
         if not self._same_origin():
             self.send_response(403)
             self.end_headers()
             return
 
-        path = urlparse(self.path).path
         apps = load_apps()
 
         if path == "/connect-github":
-            if is_installed():
-                self._redirect("/")
-                return
-            gh_ok, _ = gh_auth_status()
-            if gh_ok:
-                self._redirect("/")
-                return
+            # Auch nach der Installation erreichbar (direkter
+            # Nutzerwunsch: "müsste man immer noch die Möglichkeit haben
+            # sich ins Git einzuloggen") -- z.B. um eine kaputte
+            # Credential-Helper-Verdrahtung zu reparieren (echter Fall:
+            # `gh auth status` meldete "angemeldet", aber rohes
+            # "git fetch" scheiterte trotzdem, siehe ensure_gh_auth()'s
+            # gh-auth-setup-git-Fix). Kein früher Ausstieg mehr, auch
+            # wenn gh_auth_status() schon "verbunden" meldet -- der
+            # Knopf soll ein "neu verbinden" bleiben können.
             connect_cmd = load_config().get("connect_github_cmd")
             if not connect_cmd:
                 self._send_html(
