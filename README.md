@@ -51,10 +51,22 @@ GitHub-OAuth-App mit fest registrierter Callback-URL -- jede frisch
 erzeugte LXC hat eine andere IP, das hätte pro Box eine manuelle
 GitHub-Konfiguration gebraucht.
 
-Nach erfolgreicher Installation zeigt REGObase selbst am Ende ein
-generiertes Admin-Passwort im Log (`admin` / `<generiert>`) -- damit
-kann man sich danach auf derselben Port-80-Seite einloggen (jetzt
-Basic Auth gegen REGObase's echte Benutzer-DB, siehe unten).
+Nach erfolgreicher Installation leitet die Port-80-Seite automatisch auf
+`/first-login` weiter und zeigt dort das generierte Admin-Passwort
+(`admin` / `<generiert>`) groß und kopierbar an -- diese Seite ist
+absichtlich ohne Login erreichbar, aber nur so lange, bis sich der Account
+zum ersten Mal erfolgreich einloggt. Danach verhält sie sich wie jede
+andere Seite (Basic Auth gegen REGObase's echte Benutzer-DB, siehe unten).
+Das Passwort steht zusätzlich weiterhin im Installations-Log (Fallback,
+falls der Dienst zwischen Installationsende und erstem Login neu startet
+-- dann geht der Hinweis im Arbeitsspeicher verloren, das Log bleibt).
+
+**GitHub erneut verbinden:** die Hauptseite zeigt nach der Installation
+dauerhaft eine GitHub-Statuskarte ("Verbunden als ..." / "Nicht
+verbunden") mit einem "Neu verbinden"-Knopf -- nützlich, falls z.B. der
+Git-Credential-Helper kaputt geht (`gh auth login` per Device-Flow richtet
+ihn nicht automatisch ein, `install-regobase.sh` ruft deshalb jetzt immer
+`gh auth setup-git` mit auf) oder das GitHub-Token abläuft.
 
 Backup einspielen: siehe Kommentarblock am Anfang von
 `install-regobase.sh`, oder über die Weboberfläche (Restore-Knopf).
