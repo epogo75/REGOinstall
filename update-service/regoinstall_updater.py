@@ -105,7 +105,16 @@ from urllib.parse import urlparse
 # Seite, damit sich "läuft hier wirklich die Version, die ich denke"
 # ohne journalctl-Grabbelei beantworten lässt.
 VERSION = "0.1"
-BUILD = "2026-08-15.2"
+BUILD = "2026-08-15.3"
+
+# Direkter Nutzerwunsch: "Das solltest du auch übers Repo machen" -- bis
+# hierhin gab es KEINEN Selbst-Update-Weg für dieses Skript selbst, nur
+# für REGObase (do_update() in install-regobase.sh). Jedes Deploy lief
+# über ein manuelles scp/systemctl restart, nicht über GitHub -- genau der
+# Bruch mit der eigenen "alles kommt aus dem Git-Repo"-Architektur, den
+# diese Konstante + der /self-update-Job unten beheben. Öffentliches Repo,
+# deshalb reicht ein simples curl ohne gh-Auth.
+REGOINSTALL_RAW_BASE = "https://raw.githubusercontent.com/epogo75/REGOinstall/main"
 
 APPS_CONFIG = Path("/etc/regoinstall/apps.json")
 CONFIG = Path("/etc/regoinstall/config.json")
@@ -704,9 +713,20 @@ pollLog();
 </script>"""
 
 
+_JOB_LABELS = {
+    "connect-github": "GitHub-Anmeldung",
+    "install": "Installation",
+    "self-update": "REGOinstall-Update",
+}
+
+
+def _job_label() -> str:
+    return _JOB_LABELS.get(_job_name, _job_name or "Job")
+
+
 def render_install_page() -> str:
     if _job_running:
-        job_label = {"connect-github": "GitHub-Anmeldung", "install": "Installation"}.get(_job_name, _job_name or "Job")
+        job_label = _job_label()
         body = f"""<h1>{html.escape(job_label)} läuft…</h1>
 <p>Bei der GitHub-Anmeldung erscheint hier ein Anmeldecode -- den auf
 <a href="https://github.com/login/device" target="_blank">github.com/login/device</a>
@@ -770,7 +790,7 @@ MATTERBRIDGE_PORT = 8283  # Web-Frontend, siehe install_matterbridge() in instal
 def render_index(host: str = "") -> str:
     apps = load_apps()
     job_pill = (
-        f'<span class="pill pill-warn"><span class="pill-dot"></span>{html.escape(_job_name or "Job")} läuft…</span>'
+        f'<span class="pill pill-warn"><span class="pill-dot"></span>{html.escape(_job_label())} läuft…</span>'
         if _job_running
         else '<span class="pill pill-ok"><span class="pill-dot"></span>Kein Job aktiv</span>'
     )
@@ -841,9 +861,23 @@ def render_index(host: str = "") -> str:
     else:
         docker_card = ""
 
-    body = f"""<h1>REGOinstall</h1>
-<p>{job_pill} -- <a href="/log">Log ansehen</a></p>
+    # Direkter Nutzerwunsch: "Wie wird die 80iger Seite upgedatet? ...
+    # Das solltest du auch übers Repo machen" -- bis hierhin gab es dafür
+    # nur manuelles scp+systemctl restart. Dieser Knopf lädt regoinstall_
+    # updater.py per curl frisch von GitHub (siehe REGOINSTALL_RAW_BASE
+    # oben) und startet den eigenen Dienst neu, genau wie install-
+    # regobase.sh es für REGObase selbst schon tut.
+    platform_card = f"""
+    <div class="card">
+      <div class="card-row"><h2>REGOinstall-Plattform</h2><span class="muted">v{html.escape(VERSION)} (build {html.escape(BUILD)})</span></div>
+      <form method="post" action="/self-update">
+        <button type="submit">Jetzt aktualisieren</button>
+      </form>
+    </div>"""
+
+    body = f"""<p>{job_pill} -- <a href="/log">Log ansehen</a></p>
 {github_card}
+{platform_card}
 {docker_card}
 {''.join(rows)}"""
     return _page("REGOinstall", body)
@@ -1162,6 +1196,37 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             started = run_job_async(f"update-{apps[idx]['name']}", apps[idx]["update_cmd"])
+            if not started:
+                self._send_html("<p>Es läuft schon ein Job. <a href='/'>Zurück</a></p>")
+                return
+            self._redirect("/log")
+            return
+
+        if path == "/self-update":
+            # Direkter Nutzerwunsch: "Wie wird die 80iger Seite upgedatet?
+            # Das solltest du auch übers Repo machen" -- lädt die eigene
+            # regoinstall_updater.py frisch von GitHub (öffentliches Repo,
+            # kein gh-Auth nötig). Erst vergleichen, ob sich überhaupt
+            # etwas geändert hat (gleiches Muster wie do_update() in
+            # install-regobase.sh: "kannst du da kurz überprüfen ob du
+            # aktuell bist?") -- nur bei echtem Unterschied wird die Datei
+            # ersetzt und der eigene Dienst neu gestartet. `sleep 1` VOR
+            # dem Neustart gibt dieser HTTP-Antwort Zeit, den Client noch
+            # zu erreichen, bevor `systemctl restart` den laufenden
+            # Prozess (und damit auch den run_job_async()-Hintergrund-
+            # Thread) beendet -- der neue Prozess zeigt danach einfach
+            # "Fertig", weil er frisch startet und kein Job mehr aktiv ist.
+            cmd = [
+                "bash", "-c",
+                f"tmp=$(mktemp) && "
+                f"curl -fsSL '{REGOINSTALL_RAW_BASE}/update-service/regoinstall_updater.py' -o \"$tmp\" && "
+                f"if cmp -s \"$tmp\" /opt/regoinstall/regoinstall_updater.py; then "
+                f"echo 'Bereits aktuell -- kein Update nötig.'; rm -f \"$tmp\"; "
+                f"else echo 'Update gefunden, wende an...'; "
+                f"mv \"$tmp\" /opt/regoinstall/regoinstall_updater.py; "
+                f"sleep 1 && systemctl restart regoinstall.service; fi",
+            ]
+            started = run_job_async("self-update", cmd)
             if not started:
                 self._send_html("<p>Es läuft schon ein Job. <a href='/'>Zurück</a></p>")
                 return
