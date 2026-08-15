@@ -111,6 +111,14 @@ APPS_CONFIG = Path("/etc/regoinstall/apps.json")
 CONFIG = Path("/etc/regoinstall/config.json")
 LOG_DIR = Path("/var/log/regoinstall")
 BACKUP_DIR = Path("/var/backups/regoinstall")
+# _pending_first_login/_first_login_token (siehe unten) waren ursprünglich
+# reine Prozess-Globals -- ein echter Vorfall live gefunden: ein Neustart
+# des Dienstes genau in dem Fenster zwischen Installationsende und erstem
+# Login (z.B. durch ein Deploy dieses Skripts selbst, wie hier passiert)
+# löscht beide sofort, obwohl das Cookie im Browser des Nutzers noch gültig
+# wäre. Deshalb hier auf Platte gespiegelt (0600, root-only -- gleiche
+# Sensitivität wie das Klartext-Passwort im Install-Log).
+FIRST_LOGIN_STATE = Path("/etc/regoinstall/first_login_state.json")
 PORT = 80
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -246,6 +254,7 @@ def check_auth(header: str | None) -> bool:
         global _pending_first_login, _first_login_token
         _pending_first_login = None  # einmal erfolgreich eingeloggt, Hinweis nicht mehr nötig
         _first_login_token = None
+        _save_first_login_state()
     return ok
 
 
@@ -253,6 +262,34 @@ _pending_first_login: str | None = None
 _first_login_token: str | None = None
 _FIRST_LOGIN_RE = re.compile(r"Erstinstallations-Admin-Login:\s*(\S+)\s*/\s*(\S+)")
 FIRST_LOGIN_COOKIE = "regoinstall_first_login"
+
+
+def _save_first_login_state() -> None:
+    # Persistiert den aktuellen Stand von _pending_first_login/
+    # _first_login_token auf Platte, damit ein Dienst-Neustart (z.B. durch
+    # ein Deploy dieses Skripts selbst) das Cookie im Browser des Nutzers
+    # nicht wertlos macht -- siehe FIRST_LOGIN_STATE's Kommentar oben.
+    data = {}
+    if _first_login_token is not None:
+        data["token"] = _first_login_token
+    if _pending_first_login is not None:
+        data["credentials"] = _pending_first_login
+    if data:
+        FIRST_LOGIN_STATE.parent.mkdir(parents=True, exist_ok=True)
+        FIRST_LOGIN_STATE.write_text(json.dumps(data))
+        FIRST_LOGIN_STATE.chmod(0o600)
+    else:
+        FIRST_LOGIN_STATE.unlink(missing_ok=True)
+
+
+def _load_first_login_state() -> None:
+    global _pending_first_login, _first_login_token
+    try:
+        data = json.loads(FIRST_LOGIN_STATE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    _first_login_token = data.get("token")
+    _pending_first_login = data.get("credentials")
 
 
 def run_job_async(name: str, cmd: list[str]) -> bool:
@@ -281,13 +318,18 @@ def run_job_async(name: str, cmd: list[str]) -> bool:
                 # zeigt es EINMALIG groß+kopierbar an, unauthentifiziert
                 # (dieselbe Begründung wie is_installed()'s eigener
                 # Auth-Bypass: das ist genau das Zeitfenster, bevor der
-                # Nutzer das erste Mal etwas zum Einloggen hat). Bewusst
-                # NICHT persistiert (kein Neustart-Überleben) und wird
-                # beim ersten erfolgreichen echten Login automatisch
-                # gelöscht (siehe check_auth()).
+                # Nutzer das erste Mal etwas zum Einloggen hat). Auf Platte
+                # gespiegelt (siehe _save_first_login_state()) -- ein
+                # zweiter echter Vorfall live gefunden: ein Dienst-Neustart
+                # genau in diesem Fenster (z.B. durch ein Deploy dieses
+                # Skripts selbst) hätte sonst den In-Memory-Hinweis gelöscht,
+                # obwohl das Cookie im Browser des Nutzers noch gültig war,
+                # und wieder zum kompletten Ausschluss geführt. Gelöscht
+                # beim ersten erfolgreichen echten Login (siehe check_auth()).
                 match = _FIRST_LOGIN_RE.search(log_path.read_text(errors="replace"))
                 if match:
                     _pending_first_login = f"{match.group(1)} / {match.group(2)}"
+                    _save_first_login_state()
         finally:
             with _job_lock:
                 _job_running = False
@@ -946,9 +988,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # Token für den späteren /first-login-Zugriff: nur DIESER
             # Browser (der die Installation gerade ausgelöst hat) bekommt
-            # das Cookie, siehe _require_auth()'s Kommentar dazu.
+            # das Cookie, siehe _require_auth()'s Kommentar dazu. Sofort
+            # gespeichert (nicht erst am Job-Ende), damit ein Neustart des
+            # Dienstes auch WÄHREND einer laufenden Installation das
+            # Cookie nicht entwertet.
             global _first_login_token
             _first_login_token = secrets.token_urlsafe(32)
+            _save_first_login_state()
             self._redirect(
                 "/log",
                 extra_headers={
@@ -1038,6 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    _load_first_login_state()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"REGOinstall v{VERSION} (build {BUILD}) läuft auf Port {PORT}")
     server.serve_forever()
