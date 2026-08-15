@@ -491,7 +491,13 @@ def _live_log_block() -> str:
     # + kopierbar anzeigen. `gh auth login`'s echtes Ausgabeformat
     # (live geprüft): "! First copy your one-time code: XXXX-XXXX".
     log_text = html.escape(latest_log())
-    return f"""<div id="deviceCodeBox" style="display:none;background:#eef6ff;border:1px solid #9cf;border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.8rem;">
+    # Direkter Nutzerwunsch: "man weiß nie, wenn du fertig bist -- zurück
+    # ist immer eingeblendet" -- vorher gab es außer dem rohen Log-Text
+    # kein sichtbares Signal, ob ein Job noch läuft oder schon fertig ist.
+    status_text = "⏳ Läuft…" if _job_running else "✓ Fertig"
+    status_color = "#c80" if _job_running else "#2a7"
+    return f"""<p id="jobStatus" style="font-weight:700;color:{status_color};">{status_text}</p>
+<div id="deviceCodeBox" style="display:none;background:#eef6ff;border:1px solid #9cf;border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.8rem;">
   <p style="margin:0 0 0.4rem;">GitHub-Anmeldecode:</p>
   <code id="deviceCode" style="font-size:1.4rem;font-weight:700;letter-spacing:0.05em;"></code>
   <button type="button" onclick="copyDeviceCode()">Kopieren</button>
@@ -526,6 +532,10 @@ async function pollLog() {{
         document.getElementById('deviceCode').textContent = code;
         document.getElementById('deviceCodeBox').style.display = 'block';
       }}
+      const running = res.headers.get('X-Job-Running') === 'true';
+      const statusEl = document.getElementById('jobStatus');
+      statusEl.textContent = running ? '⏳ Läuft…' : '✓ Fertig';
+      statusEl.style.color = running ? '#c80' : '#2a7';
     }}
   }} catch (e) {{}}
   setTimeout(pollLog, 1500);
@@ -762,6 +772,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
+            # Eigener Header statt eigenem JSON-Endpunkt fürs Job-Ende --
+            # das Polling-JS in _live_log_block() liest ihn bei jedem
+            # ohnehin schon laufenden Log-Poll mit, kein zweiter Request
+            # nötig. Direkter Nutzerwunsch: "man weiß nie, wenn du fertig
+            # bist -- zurück ist immer eingeblendet" -- vorher gab es gar
+            # kein sichtbares Fertig-Signal, nur den Log-Text selbst.
+            self.send_header("X-Job-Running", "true" if _job_running else "false")
             self.end_headers()
             self.wfile.write(encoded)
         elif path.startswith("/restore/"):
