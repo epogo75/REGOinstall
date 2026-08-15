@@ -105,7 +105,7 @@ from urllib.parse import urlparse
 # Seite, damit sich "läuft hier wirklich die Version, die ich denke"
 # ohne journalctl-Grabbelei beantworten lässt.
 VERSION = "0.1"
-BUILD = "2026-08-15.1"
+BUILD = "2026-08-15.2"
 
 APPS_CONFIG = Path("/etc/regoinstall/apps.json")
 CONFIG = Path("/etc/regoinstall/config.json")
@@ -148,6 +148,28 @@ def gh_auth_status() -> tuple[bool, str | None]:
         return False, None
     login = result.stdout.strip()
     return (True, login) if login else (False, None)
+
+
+def docker_status() -> list[dict]:
+    """Liste laufender/gestoppter Docker-Container (Name/Status/Image).
+    `docker` existiert vor der Installation noch nicht -- fehlender
+    Befehl zählt als "keine Container", kein Fehler (gleiches Muster wie
+    gh_auth_status() oben)."""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}|{{.Status}}|{{.Image}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    containers = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) == 3:
+            containers.append({"name": parts[0], "status": parts[1], "image": parts[2]})
+    return containers
 
 
 def _get_hasher():
@@ -508,20 +530,112 @@ def restore_backup(app: dict, backup_name: str) -> None:
 
 
 PAGE_STYLE = """
-body { font-family: system-ui, sans-serif; margin: 2rem; background: #f4f5f7; }
-.card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1rem; max-width: 500px; }
-button { margin-right: 0.5rem; padding: 0.4rem 0.8rem; }
-button.danger { background: #b3261e; color: white; border: none; }
+:root {
+  --bg: #f1f3f6;
+  --surface: #ffffff;
+  --border: #e1e4ea;
+  --text: #1c1f26;
+  --muted: #6b7280;
+  --accent: #2f6fed;
+  --accent-hover: #1f57c9;
+  --ok: #1c8a53;
+  --ok-bg: #e6f6ed;
+  --warn: #b3691e;
+  --warn-bg: #fdf1e3;
+  --danger: #b3261e;
+  --danger-bg: #fdecea;
+  --info-bg: #eef4ff;
+  --info-border: #b9d0fb;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(20, 24, 32, 0.04), 0 1px 8px rgba(20, 24, 32, 0.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161b;
+    --surface: #1c1f26;
+    --border: #2a2e37;
+    --text: #eceef2;
+    --muted: #9aa1ad;
+    --accent: #5b8dff;
+    --accent-hover: #7ba0ff;
+    --ok: #3ecb82;
+    --ok-bg: #103322;
+    --warn: #e8a355;
+    --warn-bg: #3a2a12;
+    --danger: #f0685f;
+    --danger-bg: #3a1815;
+    --info-bg: #17223c;
+    --info-border: #2d4c8c;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 1px 8px rgba(0, 0, 0, 0.25);
+  }
+}
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+.page { max-width: 640px; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
+.topbar {
+  display: flex; align-items: baseline; gap: 0.6rem;
+  padding: 0 0.1rem 1.25rem;
+}
+.topbar .brand { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.01em; }
+.topbar .tagline { color: var(--muted); font-size: 0.85rem; }
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.6rem; }
+p { line-height: 1.5; }
+a { color: var(--accent); }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 1.1rem 1.3rem;
+  margin-bottom: 1rem;
+}
+.card-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; }
+.muted { color: var(--muted); }
+.pill {
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+}
+.pill-ok { background: var(--ok-bg); color: var(--ok); }
+.pill-warn { background: var(--warn-bg); color: var(--warn); }
+.pill-danger { background: var(--danger-bg); color: var(--danger); }
+.pill-dot { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: currentColor; }
+button {
+  font: inherit; cursor: pointer;
+  border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text);
+  padding: 0.45rem 0.9rem; margin: 0.2rem 0.5rem 0.2rem 0;
+}
+button[type="submit"]:not(.danger) { background: var(--accent); color: white; border-color: var(--accent); }
+button[type="submit"]:not(.danger):hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.danger { background: var(--danger); color: white; border-color: var(--danger); }
+form { display: inline; }
+ul { padding-left: 1.1rem; margin: 0.5rem 0; }
+li { margin-bottom: 0.3rem; }
+code { background: var(--bg); padding: 0.1rem 0.4rem; border-radius: 4px; }
+input[type="file"] { color: var(--text); }
+.info-box { background: var(--info-bg); border: 1px solid var(--info-border); border-radius: var(--radius); padding: 0.8rem 1rem; margin-bottom: 0.8rem; }
+.footer { margin-top: 2rem; color: var(--muted); font-size: 0.75rem; }
 """
 
 
 def _page(title: str, body: str) -> str:
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
 <style>{PAGE_STYLE}</style>
 </head><body>
+<div class="page">
+<div class="topbar"><span class="brand">REGOinstall</span><span class="tagline">Update- &amp; Backup-Plattform</span></div>
 {body}
-<p style="margin-top:2rem;color:#999;font-size:0.75rem;">REGOinstall v{html.escape(VERSION)} (build {html.escape(BUILD)})</p>
+<p class="footer">REGOinstall v{html.escape(VERSION)} (build {html.escape(BUILD)})</p>
+</div>
 </body></html>"""
 
 
@@ -540,17 +654,17 @@ def _live_log_block() -> str:
     # Direkter Nutzerwunsch: "man weiß nie, wenn du fertig bist -- zurück
     # ist immer eingeblendet" -- vorher gab es außer dem rohen Log-Text
     # kein sichtbares Signal, ob ein Job noch läuft oder schon fertig ist.
-    status_text = "⏳ Läuft…" if _job_running else "✓ Fertig"
-    status_color = "#c80" if _job_running else "#2a7"
-    return f"""<p id="jobStatus" style="font-weight:700;color:{status_color};">{status_text}</p>
-<div id="deviceCodeBox" style="display:none;background:#eef6ff;border:1px solid #9cf;border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.8rem;">
+    status_class = "pill-warn" if _job_running else "pill-ok"
+    status_text = "Läuft…" if _job_running else "Fertig"
+    return f"""<p><span id="jobStatus" class="pill {status_class}"><span class="pill-dot"></span>{status_text}</span></p>
+<div id="deviceCodeBox" class="info-box" style="display:none;">
   <p style="margin:0 0 0.4rem;">GitHub-Anmeldecode:</p>
   <code id="deviceCode" style="font-size:1.4rem;font-weight:700;letter-spacing:0.05em;"></code>
   <button type="button" onclick="copyDeviceCode()">Kopieren</button>
   <span id="copyStatus" class="muted"></span>
   <p style="margin:0.5rem 0 0;"><a href="https://github.com/login/device" target="_blank">github.com/login/device öffnen</a></p>
 </div>
-<pre id="log" style="background:#111;color:#ddd;padding:0.8rem;max-height:400px;overflow:auto;border-radius:8px;">{log_text}</pre>
+<pre id="log" style="background:#0d0f13;color:#d7dbe0;padding:0.9rem;max-height:400px;overflow:auto;border-radius:var(--radius);border:1px solid var(--border);">{log_text}</pre>
 <script>
 function copyDeviceCode() {{
   const code = document.getElementById('deviceCode').textContent;
@@ -580,8 +694,8 @@ async function pollLog() {{
       }}
       const running = res.headers.get('X-Job-Running') === 'true';
       const statusEl = document.getElementById('jobStatus');
-      statusEl.textContent = running ? '⏳ Läuft…' : '✓ Fertig';
-      statusEl.style.color = running ? '#c80' : '#2a7';
+      statusEl.className = 'pill ' + (running ? 'pill-warn' : 'pill-ok');
+      statusEl.innerHTML = '<span class="pill-dot"></span>' + (running ? 'Läuft…' : 'Fertig');
     }}
   }} catch (e) {{}}
   setTimeout(pollLog, 1500);
@@ -631,7 +745,7 @@ def render_first_login_page() -> str:
     # erfolgreich benutzt wurde (siehe _require_auth()/check_auth()).
     creds = html.escape(_pending_first_login or "")
     body = f"""<h1>Installation abgeschlossen</h1>
-<div class="card" style="background:#eef6ff;border-color:#9cf;">
+<div class="info-box">
   <p>Dein Admin-Login (nur dieses eine Mal hier sichtbar -- notieren!):</p>
   <code id="creds" style="font-size:1.3rem;font-weight:700;">{creds}</code>
   <button type="button" onclick="copyCreds()">Kopieren</button>
@@ -650,9 +764,16 @@ function copyCreds() {{
     return _page("Installation abgeschlossen", body)
 
 
-def render_index() -> str:
+MATTERBRIDGE_PORT = 8283  # Web-Frontend, siehe install_matterbridge() in install-regobase.sh (network_mode: host)
+
+
+def render_index(host: str = "") -> str:
     apps = load_apps()
-    running = "Ja" if _job_running else "Nein"
+    job_pill = (
+        f'<span class="pill pill-warn"><span class="pill-dot"></span>{html.escape(_job_name or "Job")} läuft…</span>'
+        if _job_running
+        else '<span class="pill pill-ok"><span class="pill-dot"></span>Kein Job aktiv</span>'
+    )
     rows = []
     for i, app in enumerate(apps):
         name = html.escape(app["name"])
@@ -666,37 +787,64 @@ def render_index() -> str:
                 for b in backups[:5]
             )
         else:
-            backup_list = "<li>(noch keins)</li>"
+            backup_list = "<li class='muted'>(noch keins)</li>"
         rows.append(f"""
         <div class="card">
-          <h2>{name}</h2>
-          <p><a href="{url}" target="_blank">{url} öffnen</a></p>
-          <form method="post" action="/update/{i}" style="display:inline">
+          <div class="card-row"><h2>{name}</h2><a href="{url}" target="_blank">öffnen ↗</a></div>
+          <form method="post" action="/update/{i}">
             <button type="submit">Update starten</button>
           </form>
-          <form method="post" action="/backup/{i}" style="display:inline">
+          <form method="post" action="/backup/{i}">
             <button type="submit">Backup jetzt erstellen</button>
           </form>
-          <p>Letzte Backups: (<a href="/restore/{i}">Backup hochladen</a>)</p>
+          <p class="muted">Letzte Backups (<a href="/restore/{i}">Backup hochladen</a>):</p>
           <ul>{backup_list}</ul>
         </div>
         """)
     gh_ok, gh_login = gh_auth_status()
-    github_status = (
-        f"✓ Verbunden als <strong>{html.escape(gh_login or '')}</strong>" if gh_ok else "✗ Nicht verbunden"
+    github_pill = (
+        f'<span class="pill pill-ok"><span class="pill-dot"></span>Verbunden als {html.escape(gh_login or "")}</span>'
+        if gh_ok
+        else '<span class="pill pill-danger"><span class="pill-dot"></span>Nicht verbunden</span>'
     )
     github_card = f"""
     <div class="card">
-      <h2>GitHub</h2>
-      <p>{github_status}</p>
+      <div class="card-row"><h2>GitHub</h2>{github_pill}</div>
       <form method="post" action="/connect-github">
         <button type="submit">{"Neu verbinden" if gh_ok else "Mit GitHub verbinden"}</button>
       </form>
     </div>"""
 
+    # Direkter Nutzerwunsch: "Link zur Matterbridge Installation" + "den
+    # Docker status" -- listet alle Container (nicht nur matterbridge,
+    # damit später hinzukommende Container automatisch mit auftauchen)
+    # und verlinkt gezielt auf Matterbridges eigenes Web-Frontend, sobald
+    # ein Container namens "matterbridge" existiert.
+    containers = docker_status()
+    if containers:
+        container_rows = "".join(
+            f"""<li><span class="pill {'pill-ok' if c['status'].startswith('Up') else 'pill-danger'}">"""
+            f"""<span class="pill-dot"></span>{html.escape(c['name'])}</span> """
+            f"""<span class="muted">{html.escape(c['status'])} -- {html.escape(c['image'])}</span></li>"""
+            for c in containers
+        )
+        matterbridge_link = ""
+        if host and any(c["name"] == "matterbridge" for c in containers):
+            mb_url = f"http://{html.escape(host)}:{MATTERBRIDGE_PORT}/"
+            matterbridge_link = f'<p><a href="{mb_url}" target="_blank">Matterbridge-Oberfläche öffnen ↗</a></p>'
+        docker_card = f"""
+        <div class="card">
+          <h2>Docker</h2>
+          <ul>{container_rows}</ul>
+          {matterbridge_link}
+        </div>"""
+    else:
+        docker_card = ""
+
     body = f"""<h1>REGOinstall</h1>
-<p>Läuft gerade ein Job? {running} -- <a href="/log">Log ansehen</a></p>
+<p>{job_pill} -- <a href="/log">Log ansehen</a></p>
 {github_card}
+{docker_card}
 {''.join(rows)}"""
     return _page("REGOinstall", body)
 
@@ -829,7 +977,11 @@ class Handler(BaseHTTPRequestHandler):
             if is_installed() and _pending_first_login is not None:
                 self._redirect("/first-login")
                 return
-            self._send_html(render_index() if is_installed() else render_install_page())
+            if is_installed():
+                host = (self.headers.get("Host") or "").split(":")[0]
+                self._send_html(render_index(host))
+            else:
+                self._send_html(render_install_page())
         elif path == "/log":
             self._send_html(_page("Log", f"{_live_log_block()}<p><a href='/'>Zurück</a></p>"))
         elif path == "/log-content":
