@@ -66,9 +66,7 @@ main() {
   echo "=== REGObase-LXC anlegen ==="
   echo ""
 
-  local next_id
-  next_id="$(pvesh get /cluster/nextid 2>/dev/null || echo 200)"
-  ask "VMID" "$next_id"
+  ask "VMID" "300"
   local vmid="$REPLY"
 
   ask "Hostname" "REGObase"
