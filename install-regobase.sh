@@ -329,7 +329,32 @@ print_summary() {
 }
 
 do_update() {
-  log "Update: git pull auf allen drei Repos..."
+  # Erst prüfen ob es überhaupt was zu tun gibt (direkter Nutzerwunsch:
+  # "kannst du da kurz überprüfen ob du aktuell bist?") -- ein "Update"-
+  # Klick soll nicht jedes Mal blind den ganzen schweren Teil (pip, npm
+  # build, Matterbridge-Neubau, Neustart) durchlaufen, wenn auf GitHub
+  # seit dem letzten Mal gar nichts Neues liegt.
+  log "Prüfe, ob es Updates gibt..."
+  local any_changes=0
+  for repo in "${REPOS[@]}"; do
+    (cd "$INSTALL_ROOT/$repo" && git fetch --quiet origin)
+    local local_rev remote_rev
+    local_rev="$(cd "$INSTALL_ROOT/$repo" && git rev-parse HEAD)"
+    remote_rev="$(cd "$INSTALL_ROOT/$repo" && git rev-parse origin/main)"
+    if [ "$local_rev" != "$remote_rev" ]; then
+      log "$repo: Update verfügbar ($local_rev -> $remote_rev)."
+      any_changes=1
+    else
+      log "$repo: bereits aktuell ($local_rev)."
+    fi
+  done
+
+  if [ "$any_changes" -eq 0 ]; then
+    echo "Bereits aktuell -- kein Update nötig."
+    return 0
+  fi
+
+  log "Hole aktuellen Stand..."
   for repo in "${REPOS[@]}"; do
     (cd "$INSTALL_ROOT/$repo" && git pull --ff-only)
   done
