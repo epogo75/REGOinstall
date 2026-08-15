@@ -247,7 +247,21 @@ install_update_service() {
 EOF
   fi
 
-  cat > /etc/systemd/system/regoinstall.service <<'EOF'
+  if [ ! -f /etc/regoinstall/config.json ]; then
+    cat > /etc/regoinstall/config.json <<EOF
+{
+  "auth_db": "${INSTALL_ROOT}/REGObase/backend/data/regobase.db"
+}
+EOF
+  fi
+
+  # Nutzt REGObase's eigenes venv statt Systempython -- das hat
+  # argon2-cffi schon installiert (exakt dieselbe Version, mit der die
+  # Passwort-Hashes in der users-Tabelle erzeugt wurden), keine separate
+  # Installation nötig. Bleibt trotzdem resilient gegenüber einem
+  # abgestürzten regobase.service, da nur die Dateien des venvs
+  # gebraucht werden, kein laufender REGObase-Prozess.
+  cat > /etc/systemd/system/regoinstall.service <<EOF
 [Unit]
 Description=REGOinstall (Update-/Backup-Oberfläche, Port 80)
 After=network-online.target
@@ -255,7 +269,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 /opt/regoinstall/regoinstall_updater.py
+ExecStart=${INSTALL_ROOT}/REGObase/backend/.venv/bin/python3 /opt/regoinstall/regoinstall_updater.py
 Restart=on-failure
 RestartSec=5
 
