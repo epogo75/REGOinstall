@@ -84,9 +84,12 @@ install-regobase.sh am Ende aktualisiert):
 
 import base64
 import html
+import io
 import json
+import shutil
 import sqlite3
 import subprocess
+import tarfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -316,6 +319,73 @@ def list_backups(app_name: str) -> list[str]:
     return sorted((p.name for p in app_dir.iterdir() if p.is_dir()), reverse=True)
 
 
+MAX_BACKUP_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB, generous headroom over a real ~85MB regobase.db
+
+
+def make_backup_archive(app: dict, backup_name: str) -> bytes:
+    """Packt ein bestehendes lokales Backup als .tar.gz -- zum
+    Herunterladen und auf einer anderen Maschine wieder Hochladen
+    (direkter Nutzerwunsch: "kann ich die auch runterladen und auf der
+    nächsten Maschine wieder hochladen?"). Gleiche Allowlist-Prüfung
+    wie restore_backup() -- backup_name muss ein echter, von
+    make_backup() angelegter Ordnername sein."""
+    if backup_name not in list_backups(app["name"]):
+        raise FileNotFoundError(f"Backup {backup_name} nicht gefunden.")
+    backup_dir = BACKUP_DIR / app["name"] / backup_name
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for file in sorted(backup_dir.iterdir()):
+            if file.is_file():
+                tar.add(file, arcname=file.name)
+    return buf.getvalue()
+
+
+def import_backup_archive(app: dict, data: bytes) -> str:
+    """Kehrseite von make_backup_archive() -- ein hochgeladenes .tar.gz
+    wird in einen NEUEN lokalen Backup-Ordner entpackt, taucht danach
+    ganz normal in list_backups() auf und kann über den bereits
+    bestehenden (getesteten) restore_backup()-Weg eingespielt werden --
+    keine zweite Restore-Logik nötig.
+
+    tarfile.extractall() ohne Schutz ist ein klassischer Path-Traversal-
+    Weg (Mitglieder mit "../" oder absoluten Pfaden können außerhalb des
+    Zielordners landen) -- hier zusätzlich zu filter="data" (PEP 706)
+    noch eine eigene, explizite Prüfung: jeder Eintrag muss ein
+    einfacher Dateiname ohne "/" sein, das Archiv besteht nur aus
+    flachen Dateien (siehe make_backup_archive())."""
+    if len(data) > MAX_BACKUP_UPLOAD_BYTES:
+        raise ValueError(f"Datei zu groß (>{MAX_BACKUP_UPLOAD_BYTES // (1024*1024)} MB).")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    app_dir = BACKUP_DIR / app["name"]
+    dest_dir = app_dir / f"{stamp}-hochgeladen"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    app_dir.chmod(0o700)
+    dest_dir.mkdir(exist_ok=False)
+    dest_dir.chmod(0o700)
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            members = tar.getmembers()
+            for member in members:
+                if not member.isfile() or "/" in member.name or member.name in ("..", "."):
+                    raise ValueError(f"Ungültiger Eintrag im Archiv: {member.name!r}")
+            tar.extractall(dest_dir, members=members, filter="data")
+        for extracted in dest_dir.iterdir():
+            extracted.chmod(0o600)
+    except Exception:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise
+
+    db_name = Path(app["backup_db"]).name
+    if not (dest_dir / db_name).exists():
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        raise ValueError(f"Archiv enthält keine {db_name} -- kein gültiges Backup für {app['name']}.")
+
+    return dest_dir.name
+
+
 def restore_backup(app: dict, backup_name: str) -> None:
     """Spielt ein Backup ein -- überschreibt echte Live-Daten, deshalb
     erst ein eigenes Sicherheits-Backup des aktuellen Stands (falls man
@@ -389,9 +459,32 @@ def _page(title: str, body: str) -> str:
 # Laden schon server-seitig mit dem aktuellen Log gefüllt, funktioniert
 # also auch ganz ohne JS (nur eben ohne Live-Aktualisierung).
 def _live_log_block() -> str:
+    # Direkter Nutzerwunsch: den gh-Anmeldecode nicht nur irgendwo im
+    # rohen Log suchen lassen, sondern client-seitig herausfiltern, groß
+    # + kopierbar anzeigen. `gh auth login`'s echtes Ausgabeformat
+    # (live geprüft): "! First copy your one-time code: XXXX-XXXX".
     log_text = html.escape(latest_log())
-    return f"""<pre id="log" style="background:#111;color:#ddd;padding:0.8rem;max-height:400px;overflow:auto;border-radius:8px;">{log_text}</pre>
+    return f"""<div id="deviceCodeBox" style="display:none;background:#eef6ff;border:1px solid #9cf;border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.8rem;">
+  <p style="margin:0 0 0.4rem;">GitHub-Anmeldecode:</p>
+  <code id="deviceCode" style="font-size:1.4rem;font-weight:700;letter-spacing:0.05em;"></code>
+  <button type="button" onclick="copyDeviceCode()">Kopieren</button>
+  <span id="copyStatus" class="muted"></span>
+  <p style="margin:0.5rem 0 0;"><a href="https://github.com/login/device" target="_blank">github.com/login/device öffnen</a></p>
+</div>
+<pre id="log" style="background:#111;color:#ddd;padding:0.8rem;max-height:400px;overflow:auto;border-radius:8px;">{log_text}</pre>
 <script>
+function copyDeviceCode() {{
+  const code = document.getElementById('deviceCode').textContent;
+  navigator.clipboard.writeText(code).then(() => {{
+    const s = document.getElementById('copyStatus');
+    s.textContent = 'kopiert!';
+    setTimeout(() => {{ s.textContent = ''; }}, 2000);
+  }});
+}}
+function extractDeviceCode(text) {{
+  const m = text.match(/one-time code:\\s*([A-Z0-9-]+)/);
+  return m ? m[1] : null;
+}}
 async function pollLog() {{
   try {{
     const res = await fetch('/log-content');
@@ -401,6 +494,11 @@ async function pollLog() {{
       const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
       el.textContent = text;
       if (atBottom) el.scrollTop = el.scrollHeight;
+      const code = extractDeviceCode(text);
+      if (code) {{
+        document.getElementById('deviceCode').textContent = code;
+        document.getElementById('deviceCodeBox').style.display = 'block';
+      }}
     }}
   }} catch (e) {{}}
   setTimeout(pollLog, 1500);
@@ -413,9 +511,9 @@ def render_install_page() -> str:
     if _job_running:
         job_label = {"connect-github": "GitHub-Anmeldung", "install": "Installation"}.get(_job_name, _job_name or "Job")
         body = f"""<h1>{html.escape(job_label)} läuft…</h1>
-<p>Bei der GitHub-Anmeldung erscheint hier ein Code + ein Link zu
+<p>Bei der GitHub-Anmeldung erscheint hier ein Anmeldecode -- den auf
 <a href="https://github.com/login/device" target="_blank">github.com/login/device</a>
--- dort bestätigen, dann läuft es automatisch weiter.</p>
+bestätigen, dann läuft es automatisch weiter.</p>
 {_live_log_block()}"""
         return _page("REGOinstall", body)
 
@@ -423,8 +521,9 @@ def render_install_page() -> str:
     if not gh_ok:
         body = """<h1>REGObase installieren</h1>
 <p>Erster Schritt: mit GitHub anmelden (REGObase/REGOcore/regoeldat-core
-sind private Repos). Ein Klick zeigt einen Code + Link -- der muss auf
-github.com/login/device bestätigt werden.</p>
+sind private Repos). Ein Klick zeigt einen Code + einen Link zu
+<a href="https://github.com/login/device" target="_blank">github.com/login/device</a> --
+dort bestätigen.</p>
 <form method="post" action="/connect-github">
   <button type="submit">Mit GitHub anmelden</button>
 </form>"""
@@ -449,7 +548,10 @@ def render_index() -> str:
         backups = list_backups(app["name"])
         if backups:
             backup_list = "".join(
-                f"<li>{html.escape(b)} -- <a href='/restore/{i}'>wiederherstellen</a></li>" for b in backups[:5]
+                f"<li>{html.escape(b)} -- "
+                f"<a href='/restore/{i}'>wiederherstellen</a> -- "
+                f"<a href='/backup/{i}/{html.escape(b)}/download'>herunterladen</a></li>"
+                for b in backups[:5]
             )
         else:
             backup_list = "<li>(noch keins)</li>"
@@ -463,7 +565,7 @@ def render_index() -> str:
           <form method="post" action="/backup/{i}" style="display:inline">
             <button type="submit">Backup jetzt erstellen</button>
           </form>
-          <p>Letzte Backups:</p>
+          <p>Letzte Backups: (<a href="/restore/{i}">Backup hochladen</a>)</p>
           <ul>{backup_list}</ul>
         </div>
         """)
@@ -473,13 +575,38 @@ def render_index() -> str:
     return _page("REGOinstall", body)
 
 
-def render_restore_confirm(idx: int, app: dict) -> str | None:
+def render_restore_confirm(idx: int, app: dict) -> str:
     backups = list_backups(app["name"])
+    upload_block = f"""
+    <div class="card">
+      <p>Backup von einer anderen Maschine hochladen (.tar.gz von "herunterladen"):</p>
+      <input type="file" id="backupFile" accept=".tar.gz,.gz">
+      <button type="button" onclick="uploadBackup()">Hochladen</button>
+      <p id="uploadStatus" class="muted"></p>
+    </div>
+    <script>
+    async function uploadBackup() {{
+      const input = document.getElementById('backupFile');
+      const status = document.getElementById('uploadStatus');
+      if (!input.files.length) {{ status.textContent = 'Bitte zuerst eine Datei auswählen.'; return; }}
+      status.textContent = 'Lade hoch…';
+      try {{
+        const res = await fetch('/backup/{idx}/upload', {{ method: 'POST', body: input.files[0] }});
+        if (res.redirected) {{ window.location = res.url; return; }}
+        if (!res.ok) {{ status.textContent = 'Fehler: ' + await res.text(); return; }}
+        window.location.reload();
+      }} catch (e) {{ status.textContent = 'Fehler: ' + e; }}
+    }}
+    </script>"""
     if not backups:
-        return None
+        body = f"""<h1>Restore -- {html.escape(app['name'])}</h1>
+<p>Noch keine lokalen Backups.</p>
+{upload_block}
+<p><a href="/">Zurück</a></p>"""
+        return _page(f"Restore -- {app['name']}", body)
     rows = "".join(f"""
       <div class="card">
-        <p>{html.escape(b)}</p>
+        <p>{html.escape(b)} -- <a href='/backup/{idx}/{html.escape(b)}/download'>herunterladen</a></p>
         <form method="post" action="/restore/{idx}/{html.escape(b)}">
           <button type="submit" class="danger">Dieses Backup einspielen (überschreibt Live-Daten)</button>
         </form>
@@ -489,6 +616,7 @@ def render_restore_confirm(idx: int, app: dict) -> str | None:
 <p>Vor dem Einspielen wird automatisch ein Sicherheits-Backup des aktuellen Stands erstellt.
 Der Dienst ({html.escape(app.get('service', ''))}) wird kurz gestoppt und neu gestartet.</p>
 {rows}
+{upload_block}
 <p><a href="/">Zurück</a></p>"""
     return _page(f"Restore -- {app['name']}", body)
 
@@ -550,11 +678,32 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             apps = load_apps()
-            page = render_restore_confirm(idx, apps[idx])
-            if page is None:
-                self._send_html(_page("Restore", "<p>Keine Backups vorhanden.</p><p><a href='/'>Zurück</a></p>"))
+            self._send_html(render_restore_confirm(idx, apps[idx]))
+        elif path.startswith("/backup/") and path.endswith("/download"):
+            # /backup/<idx>/<backup_name>/download -- Backup als .tar.gz
+            # herunterladen, um es auf einer anderen Maschine wieder
+            # hochzuladen (direkter Nutzerwunsch).
+            rest = path[len("/backup/"):-len("/download")]
+            idx_str, _, backup_name = rest.partition("/")
+            idx = self._parse_index(f"/backup/{idx_str}", "/backup/") if idx_str.isdigit() else None
+            if idx is None or not backup_name:
+                self.send_response(404)
+                self.end_headers()
                 return
-            self._send_html(page)
+            apps = load_apps()
+            try:
+                archive = make_backup_archive(apps[idx], backup_name)
+            except FileNotFoundError:
+                self.send_response(404)
+                self.end_headers()
+                return
+            filename = f"{apps[idx]['name']}-{backup_name}.tar.gz"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(len(archive)))
+            self.end_headers()
+            self.wfile.write(archive)
         else:
             self.send_response(404)
             self.end_headers()
@@ -671,6 +820,36 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html("<p>Es läuft schon ein Job. <a href='/'>Zurück</a></p>")
                 return
             self._redirect("/log")
+            return
+
+        if path.startswith("/backup/") and path.endswith("/upload"):
+            # /backup/<idx>/upload -- Backup-Archiv von einer anderen
+            # Maschine wieder hochladen (direkter Nutzerwunsch). Kein
+            # multipart/form-data-Parsing nötig: das <input type=file>
+            # wird per JS als roher Request-Body gePOSTet (siehe
+            # render_restore_confirm()), hier einfach Content-Length
+            # Bytes direkt vom Socket lesen.
+            idx_str = path[len("/backup/"):-len("/upload")]
+            idx = self._parse_index(f"/backup/{idx_str}", "/backup/") if idx_str.isdigit() else None
+            if idx is None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > MAX_BACKUP_UPLOAD_BYTES:
+                self.send_response(400)
+                self.end_headers()
+                return
+            data = self.rfile.read(length)
+            try:
+                import_backup_archive(apps[idx], data)
+            except Exception as exc:
+                self._send_html(f"<p>Hochladen fehlgeschlagen: {exc}</p><p><a href='/'>Zurück</a></p>", status=400)
+                return
+            self._redirect(f"/restore/{idx}")
             return
 
         if path.startswith("/backup/"):
