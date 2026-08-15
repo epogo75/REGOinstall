@@ -45,6 +45,33 @@ dieser Dienst mit einem Python laufen, das das "argon2-cffi"-Paket hat
 -- am einfachsten das venv des zugehörigen REGObase-Checkouts
 wiederverwenden (schon vorhanden, keine zusätzliche Installation nötig),
 siehe install-regobase.sh's regoinstall.service-ExecStart.
+
+Zwei Zustände, per is_installed() unterschieden (config.json's "auth_db"
+zeigt auf eine existierende Datei oder nicht):
+
+- NICHT installiert (frische LXC, bootstrap-port80.sh lief, aber noch
+  kein REGObase): "auth_db" ist null. Die Seite ist absichtlich OHNE
+  Basic-Auth erreichbar -- der echte Türsteher ist `gh auth login`'s
+  Device-Code-Flow innerhalb des Installations-Jobs selbst (privates
+  REGObase-Repo, nur der rechtmäßige GitHub-Besitzer kann den
+  angezeigten Code auf github.com/login/device bestätigen). Eine echte
+  GitHub-OAuth-App mit fester Callback-URL wurde bewusst NICHT gebaut
+  -- das würde pro LXC eine andere IP/Callback-Registrierung brauchen,
+  passt nicht zu "soll auf jedem frisch erzeugten Container funktionieren".
+  "Installieren"-Knopf POSTet auf /install, das führt config.json's
+  "install_cmd" (curl | bash von install-regobase.sh) als Hintergrund-
+  Job aus, exakt derselbe Job-Runner/Log-Viewer wie Update/Backup.
+- Installiert: "auth_db" zeigt auf die echte regobase.db. Ab hier normale
+  Basic-Auth gegen die users-Tabelle (siehe oben), Update/Backup/Restore-
+  Karten statt der Installations-Seite.
+
+/etc/regoinstall/config.json (von bootstrap-port80.sh angelegt, von
+install-regobase.sh am Ende aktualisiert):
+
+{
+  "auth_db": null,
+  "install_cmd": ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/install-regobase.sh | bash"]
+}
 """
 
 import base64
@@ -58,9 +85,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHash, VerifyMismatchError
-
 APPS_CONFIG = Path("/etc/regoinstall/apps.json")
 CONFIG = Path("/etc/regoinstall/config.json")
 LOG_DIR = Path("/var/log/regoinstall")
@@ -71,14 +95,34 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.chmod(0o700)  # enthält irgendwann Kopien von /etc/regobase.env
 
-_hasher = PasswordHasher()
-# Fixed dummy hash to verify against when a username isn't found, so a
-# "no such user" response takes the same ~100ms as a real wrong-password
-# check instead of returning near-instantly -- otherwise response timing
-# alone would let an attacker enumerate valid usernames.
-_DUMMY_HASH = _hasher.hash("not-a-real-password")
 _job_lock = threading.Lock()
 _job_running = False
+_hasher = None
+_dummy_hash = None
+
+
+def _get_hasher():
+    # "argon2-cffi" NICHT auf Modulebene importieren: vor der ersten
+    # Installation läuft dieser Dienst unter dem nackten System-Python
+    # (bootstrap-port80.sh installiert bewusst nur python3+curl, siehe
+    # is_installed()) -- ein Import auf Modulebene würde den kompletten
+    # Prozess schon beim Start crashen, lange bevor überhaupt die
+    # Installations-Seite (die gar keine Passwort-Prüfung braucht)
+    # angezeigt werden könnte. check_auth() wird ohnehin nur erreicht,
+    # nachdem is_installed() bereits bestätigt hat, dass REGObase (und
+    # damit dessen venv mit argon2-cffi) existiert.
+    global _hasher, _dummy_hash
+    if _hasher is None:
+        from argon2 import PasswordHasher
+
+        _hasher = PasswordHasher()
+        # Fixed dummy hash to verify against when a username isn't found,
+        # so a "no such user" response takes the same ~100ms as a real
+        # wrong-password check instead of returning near-instantly --
+        # otherwise response timing alone would let an attacker enumerate
+        # valid usernames.
+        _dummy_hash = _hasher.hash("not-a-real-password")
+    return _hasher, _dummy_hash
 
 
 def load_apps() -> list[dict]:
@@ -87,11 +131,31 @@ def load_apps() -> list[dict]:
     return json.loads(APPS_CONFIG.read_text())
 
 
-def auth_db_path() -> Path | None:
+def load_config() -> dict:
     if not CONFIG.exists():
-        return None
-    value = json.loads(CONFIG.read_text()).get("auth_db")
+        return {}
+    return json.loads(CONFIG.read_text())
+
+
+def auth_db_path() -> Path | None:
+    value = load_config().get("auth_db")
     return Path(value) if value else None
+
+
+def is_installed() -> bool:
+    # Vor der ersten echten Installation gibt es noch keine REGObase-
+    # Benutzer-DB, also auch keinen argon2-Login möglich -- in diesem
+    # Zustand ist die Seite absichtlich UNGESCHÜTZT (kein Basic-Auth-
+    # Gate), weil der echte Türsteher woanders sitzt: der Installations-
+    # Job ruft `gh auth login` auf (Device-Code-Flow), und der braucht
+    # eine ECHTE, manuelle Bestätigung auf github.com/login/device durch
+    # den rechtmäßigen Besitzer, egal wer auf den Knopf gedrückt hat.
+    # Funktioniert auf jeder frisch erzeugten LXC mit beliebiger IP,
+    # ohne vorher irgendwo eine feste Callback-URL registrieren zu
+    # müssen (das war der erste, verworfene Ansatz mit einer echten
+    # GitHub-OAuth-App).
+    db_path = auth_db_path()
+    return db_path is not None and db_path.exists()
 
 
 def check_auth(header: str | None) -> bool:
@@ -117,11 +181,15 @@ def check_auth(header: str | None) -> bool:
     except sqlite3.Error:
         return False
 
+    from argon2.exceptions import InvalidHash, VerifyMismatchError
+
+    hasher, dummy_hash = _get_hasher()
+
     if row is None:
         # Feste Dummy-Prüfung statt sofort False -- sonst verrät die
         # Antwortzeit, ob der Benutzername existiert.
         try:
-            _hasher.verify(_DUMMY_HASH, password)
+            hasher.verify(dummy_hash, password)
         except (VerifyMismatchError, InvalidHash):
             pass
         return False
@@ -130,7 +198,7 @@ def check_auth(header: str | None) -> bool:
     if not is_active or role != "ADMIN":
         return False
     try:
-        return _hasher.verify(password_hash, password)
+        return hasher.verify(password_hash, password)
     except (VerifyMismatchError, InvalidHash):
         return False
 
@@ -276,6 +344,27 @@ def _page(title: str, body: str) -> str:
 </body></html>"""
 
 
+def render_install_page() -> str:
+    running = _job_running
+    if running:
+        body = """<h1>REGObase wird installiert…</h1>
+<p>Läuft im Hintergrund. Der Log zeigt u.a. den GitHub-Anmeldecode
+(gh auth login, privates Repo) -- den Code auf
+<a href="https://github.com/login/device" target="_blank">github.com/login/device</a>
+eingeben, dann läuft die Installation automatisch weiter.</p>
+<p><a href="/log">Log ansehen (Seite neu laden für Fortschritt)</a></p>"""
+    else:
+        body = """<h1>REGObase installieren</h1>
+<p>Noch nicht installiert. Ein Klick startet die komplette Installation
+(Docker, Matterbridge, REGObase selbst) im Hintergrund -- dabei wird
+`gh auth login` für die privaten REGObase-Repos aufgerufen, der Code
+dafür erscheint danach im Log.</p>
+<form method="post" action="/install">
+  <button type="submit">Installation starten</button>
+</form>"""
+    return _page("REGOinstall", body)
+
+
 def render_index() -> str:
     apps = load_apps()
     running = "Ja" if _job_running else "Nein"
@@ -337,6 +426,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _require_auth(self) -> bool:
+        if not is_installed():
+            # Vor der ersten Installation gibt es noch keine REGObase-
+            # Benutzer-DB gegen die geprüft werden könnte -- der echte
+            # Türsteher ist hier `gh auth login`'s Device-Code-Flow
+            # innerhalb des Installations-Jobs selbst (siehe is_installed()'s
+            # Docstring-Kommentar).
+            return True
         if check_auth(self.headers.get("Authorization")):
             return True
         self._unauthorized()
@@ -360,7 +456,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         if path == "/":
-            self._send_html(render_index())
+            self._send_html(render_index() if is_installed() else render_install_page())
         elif path == "/log":
             self._send_html(_page("Log", f"<pre>{html.escape(latest_log())}</pre><p><a href='/'>Zurück</a></p>"))
         elif path.startswith("/restore/"):
@@ -433,6 +529,23 @@ class Handler(BaseHTTPRequestHandler):
 
         path = urlparse(self.path).path
         apps = load_apps()
+
+        if path == "/install":
+            if is_installed():
+                self._redirect("/")
+                return
+            install_cmd = load_config().get("install_cmd")
+            if not install_cmd:
+                self._send_html(
+                    _page("Install", "<p>install_cmd fehlt in /etc/regoinstall/config.json.</p>"), status=500
+                )
+                return
+            started = run_job_async("install", install_cmd)
+            if not started:
+                self._send_html("<p>Installation läuft bereits. <a href='/log'>Log ansehen</a></p>")
+                return
+            self._redirect("/log")
+            return
 
         if path.startswith("/update/"):
             idx = self._parse_index(path, "/update/")

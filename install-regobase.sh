@@ -247,13 +247,18 @@ install_update_service() {
 EOF
   fi
 
-  if [ ! -f /etc/regoinstall/config.json ]; then
-    cat > /etc/regoinstall/config.json <<EOF
+  # Immer überschreiben, nicht nur wenn fehlend -- bootstrap-port80.sh
+  # legt diese Datei schon VOR der eigentlichen Installation mit
+  # "auth_db": null an (Installations-Ansicht statt Login), hier muss
+  # der echte Pfad rein, sonst bliebe die Seite dauerhaft im "nicht
+  # installiert"-Zustand hängen, obwohl REGObase längst läuft.
+  cat > /etc/regoinstall/config.json <<EOF
 {
-  "auth_db": "${INSTALL_ROOT}/REGObase/backend/data/regobase.db"
+  "auth_db": "${INSTALL_ROOT}/REGObase/backend/data/regobase.db",
+  "install_cmd": ["bash", "-c", "curl -fsSL ${REGOINSTALL_RAW_BASE}/install-regobase.sh | bash"]
 }
 EOF
-  fi
+  chmod 600 /etc/regoinstall/config.json
 
   # Nutzt REGObase's eigenes venv statt Systempython -- das hat
   # argon2-cffi schon installiert (exakt dieselbe Version, mit der die
@@ -261,6 +266,18 @@ EOF
   # Installation nötig. Bleibt trotzdem resilient gegenüber einem
   # abgestürzten regobase.service, da nur die Dateien des venvs
   # gebraucht werden, kein laufender REGObase-Prozess.
+  #
+  # install_systemd_unit() hat regobase.service zwar schon gestartet,
+  # aber "systemctl enable --now" wartet nicht, bis run.sh's eigener
+  # Erst-Start-Bootstrap (venv anlegen, pip install, das dauert) fertig
+  # ist -- ohne diese Wartezeile würde hier auf ein venv gezeigt, das
+  # noch gar nicht existiert.
+  log "Warte auf REGObase's venv (Erst-Start-Bootstrap läuft evtl. noch)..."
+  for _ in $(seq 1 60); do
+    [ -x "${INSTALL_ROOT}/REGObase/backend/.venv/bin/python3" ] && break
+    sleep 5
+  done
+
   cat > /etc/systemd/system/regoinstall.service <<EOF
 [Unit]
 Description=REGOinstall (Update-/Backup-Oberfläche, Port 80)

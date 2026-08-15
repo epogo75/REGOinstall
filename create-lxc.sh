@@ -222,6 +222,10 @@ main() {
   echo "Aktualisiere Paketlisten und installierte Pakete..."
   pct exec "$vmid" -- bash -c "apt-get update -qq && apt-get -y -qq upgrade && apt-get install -y -qq curl"
 
+  echo "Richte die Port-80-Weboberfläche ein (nur die Oberfläche, REGObase"
+  echo "selbst installierst du danach per Klick im Browser)..."
+  pct exec "$vmid" -- bash -c "curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/bootstrap-port80.sh | bash"
+
   local lxc_ip
   lxc_ip="$(pct exec "$vmid" -- hostname -I 2>/dev/null | awk '{print $1}')"
 
@@ -229,9 +233,10 @@ main() {
   echo "================================================================"
   echo " LXC $vmid ($hostname) läuft. IP: ${lxc_ip:-unbekannt}"
   echo ""
-  echo " Nächster Schritt -- in die LXC rein und Skript 2 starten:"
-  echo "   pct enter $vmid"
-  echo "   curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/install-regobase.sh | bash"
+  echo " Nächster Schritt -- im Browser öffnen und auf 'Installieren' klicken:"
+  echo "   http://${lxc_ip:-<ip>}/"
+  echo " Der GitHub-Anmeldecode (privates Repo) erscheint danach im Log"
+  echo " auf derselben Seite -- auf github.com/login/device bestätigen."
   echo "================================================================"
 }
 
