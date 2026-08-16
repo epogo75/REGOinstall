@@ -139,9 +139,15 @@ write_cloudinit_snippet() {
   local snippet_file="${hostname}-user-data.yml"
   mkdir -p "$snippet_dir"
 
+  # -stdin + Bash-Here-String (<<<) statt des Passworts als CLI-Argument:
+  # ein Argument wäre über /proc/<pid>/cmdline bzw. `ps aux` für jeden
+  # anderen lokalen Nutzer sichtbar, solange der openssl-Prozess läuft
+  # (Review-Fund 2026-08-16, direkt am eigenen vorigen Hash-Fix). Der
+  # Here-String wird von der Shell selbst als Datei-Deskriptor
+  # bereitgestellt, kein externer Prozess sieht das Passwort als Argument.
   local root_hash rego_hash
-  root_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" "$root_password")"
-  rego_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" "$rego_password")"
+  root_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin <<< "$root_password")"
+  rego_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" -stdin <<< "$rego_password")"
 
   local snippet_path="${snippet_dir}/${snippet_file}"
   ( umask 077
