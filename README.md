@@ -32,27 +32,23 @@ nach dem Durchreichen nicht sofort in der LXC sichtbar ist, hilft ein
 
 Am Ende gibt das Skript die IP der neuen LXC aus -- im Browser öffnen.
 
-## Alternativ: Test-/Entwicklungs-VM (`create-vm.sh`)
+## Alternativ: Test-/Entwicklungs-LXC für REGObaseX1 (`create-lxc-regobasex1-dev.sh`)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/create-vm.sh -o create-vm.sh
-bash create-vm.sh
+curl -fsSL https://raw.githubusercontent.com/epogo75/REGOinstall/main/create-lxc-regobasex1-dev.sh -o create-lxc-regobasex1-dev.sh
+bash create-lxc-regobasex1-dev.sh
 ```
 
-Für Fälle, die eine echte VM statt einer LXC brauchen (z.B. REGObaseX1
-gegen einen echten Gira X1 entwickeln, ohne die produktive REGObase-LXC
-anzufassen) -- lädt ein Ubuntu-26.04-Server-Cloud-Image, legt per
-Cloud-Init einen `rego`-Sudo-Benutzer UND ein Root-Passwort an (beide
-interaktiv abgefragt, nirgends im Skript hinterlegt -- dieses Repo ist
-öffentlich), startet die VM und wartet auf den Guest-Agent, um die IP
-auszugeben. Danach: `ssh rego@<ip>`, sonst nichts vorinstalliert. Port
-5190 ist für den späteren REGObaseX1-Dev-Server reserviert, aber noch
-nichts läuft dort.
-
-**Voraussetzung:** die gewählte Storage (Default `local`) muss den
-Content-Typ "Snippets" aktiviert haben (Datacenter > Storage > Bearbeiten
-> Inhalt), sonst bricht das Skript mit einer klaren Fehlermeldung ab.
-**Noch nicht gegen ein echtes Proxmox getestet**, wie `create-lxc.sh`.
+Für die REGObaseX1-Entwicklung/-Tests gegen einen echten Gira X1, ohne die
+produktive REGObase-LXC anzufassen. Legt eine eigene Ubuntu-26.04-LXC an
+(analog zu `create-lxc.sh`, Default-VMID 310) mit zwei Benutzern: `root`
+(Fallback) und `rego` (sudo, für die tägliche Arbeit) -- beide Passwörter
+interaktiv+maskiert abgefragt, nirgends im Skript hinterlegt. Anders als
+eine VM braucht das kein Cloud-Init/Snippets-Storage: der zweite Benutzer
+wird einfach per `pct exec` nach dem Start angelegt. Installiert selbst
+nichts weiter -- Port 5190 ist nur für den späteren REGObaseX1-Dev-Server
+reserviert/dokumentiert. **Noch nicht gegen ein echtes Proxmox getestet**,
+wie `create-lxc.sh`.
 
 ## 2. REGObase installieren (im Browser, Port 80)
 
