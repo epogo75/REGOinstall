@@ -126,11 +126,26 @@ write_cloudinit_snippet() {
   # aber zwei eigene Passwörter (root + rego) gesetzt werden. ssh_pwauth
   # + disable_root:false sind nötig, weil Ubuntus Cloud-Init-Vorlage
   # Root-Login und Passwort-SSH-Login standardmäßig abschaltet.
+  #
+  # Sicherheits-Review-Fund (2026-08-16): diese Datei bleibt dauerhaft auf
+  # dem Proxmox-Host liegen (Cloud-Init liest sie bei jedem Boot über das
+  # ide2-Laufwerk) -- mit `type: text` stünden beide Passwörter also fest
+  # im Klartext auf der Platte. Stattdessen SHA-512-Crypt-Hashes (per
+  # `openssl passwd -6`, cloud-init's chpasswd erwartet genau dieses
+  # Format, wenn `type: text` weggelassen wird) UND restriktive
+  # Dateirechte (nur root) als zweite Verteidigungslinie.
   local storage="$1" hostname="$2" root_password="$3" rego_password="$4"
   local snippet_dir="/var/lib/vz/snippets"
   local snippet_file="${hostname}-user-data.yml"
   mkdir -p "$snippet_dir"
-  cat > "${snippet_dir}/${snippet_file}" <<EOF
+
+  local root_hash rego_hash
+  root_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" "$root_password")"
+  rego_hash="$(openssl passwd -6 -salt "$(openssl rand -hex 8)" "$rego_password")"
+
+  local snippet_path="${snippet_dir}/${snippet_file}"
+  ( umask 077
+    cat > "$snippet_path" <<EOF
 #cloud-config
 hostname: ${hostname}
 disable_root: false
@@ -138,8 +153,8 @@ ssh_pwauth: true
 chpasswd:
   expire: false
   users:
-    - {name: root, password: '${root_password}', type: text}
-    - {name: rego, password: '${rego_password}', type: text}
+    - {name: root, password: '${root_hash}'}
+    - {name: rego, password: '${rego_hash}'}
 users:
   - name: rego
     groups: [sudo]
@@ -154,6 +169,10 @@ packages:
 runcmd:
   - systemctl enable --now qemu-guest-agent
 EOF
+  )
+  chmod 600 "$snippet_path"
+  chown root:root "$snippet_path"
+
   echo "${storage}:snippets/${snippet_file}"
 }
 
